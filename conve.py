@@ -206,6 +206,8 @@ def main():
                         help='number of negative samples')
     parser.add_argument('--out', default='result',
                         help='Directory to output the result')
+    parser.add_argument('--val-iter', default=1000,
+                        help='validation iteration')
     args = parser.parse_args()
 
     logger.info('train: {}'.format(args.train))
@@ -246,8 +248,8 @@ def main():
     # Set up a trainer
     trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=args.out)
 
-    val_interval = 6, 'iteration'
-    log_interval = 1, 'iteration'
+    val_interval = args.val_iter, 'iteration'
+    log_interval = 100, 'iteration'
 
     trainer.extend(extensions.Evaluator(val_iter, model,
         converter=convert, device=args.gpu), trigger=val_interval)
