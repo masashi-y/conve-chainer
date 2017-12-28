@@ -82,9 +82,9 @@ class BaseModel(object):
             return loss
 
 
-class Complex(chainer.Chain, BaseModel):
+class ComplEx(chainer.Chain, BaseModel):
     def __init__(self, num_entities, num_relations, embedding_dim=200):
-        super(Complex, self).__init__()
+        super(ComplEx, self).__init__()
         self.num_entities = num_entities
         self.num_relations = num_relations
         self.embedding_dim = embedding_dim
