@@ -56,7 +56,6 @@ class ConvE(chainer.Chain):
         Output:
             loss ( float )
         """
-
         if chainer.config.train:
             probs = self.forward(e1, rel, e2)
             loss = self.loss_fun(probs, Y)
@@ -93,8 +92,6 @@ class ConvE(chainer.Chain):
         batch_size, = e1.shape
         e1_embedded = self.emb_e(e1).reshape(batch_size, 1, 10, 20)
         rel_embedded = self.emb_rel(rel).reshape(batch_size, 1, 10, 20)
-        e2_embedded = self.emb_e(e2)
-        bias = self.bias(e2).reshape((-1,))
 
         stacked_inputs = F.concat([e1_embedded, rel_embedded], axis=2)
         stacked_inputs = self.bn0(stacked_inputs)
@@ -109,6 +106,8 @@ class ConvE(chainer.Chain):
         x = self.bn2(x)
         x = F.relu(x)
         if chainer.config.train:
+            e2_embedded = self.emb_e(e2)
+            bias = self.bias(e2).reshape((-1,))
             x *= e2_embedded
             x = F.sum(x, axis=1) + bias
             pred = F.sigmoid(x)
@@ -263,7 +262,7 @@ def main():
         model.to_gpu()
 
     # Set up an optimizer
-    optimizer = O.Adam(alpha=0.003)
+    optimizer = O.Adam() # (alpha=0.003)
     optimizer.setup(model)
 
     # Set up an iterator
