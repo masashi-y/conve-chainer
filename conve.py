@@ -3,6 +3,7 @@ import argparse
 from collections import defaultdict
 
 import numpy as np
+import os
 
 import logging
 import chainer
@@ -18,11 +19,6 @@ from chainer.training import extensions
 
 logger = logging.getLogger()
 logging.basicConfig(level=logging.INFO)
-log_path = 'log'
-file_handler = logging.FileHandler(log_path)
-fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-file_handler.setFormatter(fmt)
-logger.addHandler(file_handler)
 
 class ConvE(chainer.Chain):
 
@@ -78,13 +74,13 @@ class ConvE(chainer.Chain):
                 if rank_flt <= 1:
                     hits1 += 1
                 if rank_flt <= 3:
-                    hit3 += 1
+                    hits3 += 1
                 if rank_flt <= 10:
-                    hit10 += 1
+                    hits10 += 1
             mrr /= float(batch_size)
             mrr_flt /= float(batch_size)
             hits1 /= float(batch_size)
-            hits2 /= float(batch_size)
+            hits3 /= float(batch_size)
             hits10 /= float(batch_size)
             probs = probs_all[self.xp.arange(batch_size), e2]
             loss = self.loss_fun(probs, Y)
@@ -254,6 +250,12 @@ def main():
     parser.add_argument('--init-model', default=None,
                         help='initialize model with saved one')
     args = parser.parse_args()
+
+    log_path = os.path.join(args.out, 'loginfo')
+    file_handler = logging.FileHandler(log_path)
+    fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
 
     logger.info('train: {}'.format(args.train))
     logger.info('val: {}'.format(args.val))
