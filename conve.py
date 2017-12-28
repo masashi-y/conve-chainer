@@ -82,9 +82,9 @@ class BaseModel(object):
             return loss
 
 
-class Complex(chainer.Chain, BaseModel):
+class ComplEx(chainer.Chain, BaseModel):
     def __init__(self, num_entities, num_relations, embedding_dim=200):
-        super(Complex, self).__init__()
+        super(ComplEx, self).__init__()
         self.num_entities = num_entities
         self.num_relations = num_relations
         self.embedding_dim = embedding_dim
@@ -109,23 +109,32 @@ class Complex(chainer.Chain, BaseModel):
         batch_size, = e1.shape
         e1_embedded_real = self.emb_e_real(e1).reshape(batch_size, -1)
         rel_embedded_real = self.emb_rel_real(rel).reshape(batch_size, -1)
-        e2_embedded_real = self.emb_e_real(e2).reshape(batch_size, -1)
         e1_embedded_img = self.emb_e_img(e1).reshape(batch_size, -1)
         rel_embedded_img = self.emb_rel_img(rel).reshape(batch_size, -1)
-        e2_embedded_img = self.emb_e_img(e2).reshape(batch_size, -1)
 
         e1_embedded_real = F.dropout(e1_embedded_real, 0.2)
         rel_embedded_real = F.dropout(rel_embedded_real, 0.2)
         e1_embedded_img = F.dropout(e1_embedded_img, 0.2)
         rel_embedded_img = F.dropout(rel_embedded_img, 0.2)
 
-        realrealreal = e1_embedded_real * rel_embedded_real * e2_embedded_real
-        realimgimg = e1_embedded_real * rel_embedded_img * e2_embedded_img
-        imgrealimg = e1_embedded_img * rel_embedded_real * e2_embedded_img
-        imgimgreal = e1_embedded_img * rel_embedded_img * e2_embedded_real
-        pred = realrealreal + realimgimg + imgrealimg - imgimgreal
-        pred = F.sigmoid(F.sum(pred, 1))
-        return pred
+        if chainer.config.train:
+            e2_embedded_real = self.emb_e_real(e2).reshape(batch_size, -1)
+            e2_embedded_img = self.emb_e_img(e2).reshape(batch_size, -1)
+            realrealreal = e1_embedded_real * rel_embedded_real * e2_embedded_real
+            realimgimg = e1_embedded_real * rel_embedded_img * e2_embedded_img
+            imgrealimg = e1_embedded_img * rel_embedded_real * e2_embedded_img
+            imgimgreal = e1_embedded_img * rel_embedded_img * e2_embedded_real
+            pred = realrealreal + realimgimg + imgrealimg - imgimgreal
+            pred = F.sigmoid(F.sum(pred, 1))
+            return pred
+        else:
+            realrealreal = F.matmul(e1_embedded_real * rel_embedded_real, self.emb_e_real.W, transb=True)
+            realimgimg = F.matmul(e1_embedded_real * rel_embedded_img, self.emb_e_img.W, transb=True)
+            imgrealimg = F.matmul(e1_embedded_img * rel_embedded_real, self.emb_e_img.W, transb=True)
+            imgimgreal = F.matmul(e1_embedded_img * rel_embedded_img, self.emb_e_real.W, transb=True)
+            pred = realrealreal + realimgimg + imgrealimg - imgimgreal
+            pred = F.sigmoid(pred)
+            return pred
 
 
 class ConvE(chainer.Chain, BaseModel):
@@ -290,6 +299,7 @@ def main():
     parser.add_argument('val', help='Path to validation triplet list file')
     parser.add_argument('ent_vocab', help='Path to entity vocab')
     parser.add_argument('rel_vocab', help='Path to relation vocab')
+    parser.add_argument('--model', default='conve', choices=['complex', 'conve'])
     parser.add_argument('--gpu', '-g', default=-1, type=int,
                         help='GPU ID (negative value indicates CPU)')
     parser.add_argument('--batchsize', '-b', type=int, default=1000,
@@ -315,6 +325,7 @@ def main():
     logger.info('train: {}'.format(args.train))
     logger.info('val: {}'.format(args.val))
     logger.info('gpu: {}'.format(args.gpu))
+    logger.info('model: {}'.format(args.model))
     logger.info('batchsize: {}'.format(args.batchsize))
     logger.info('epoch: {}'.format(args.epoch))
     logger.info('negative-size: {}'.format(args.negative_size))
@@ -330,7 +341,12 @@ def main():
     train = TripletDataset(ent_vocab, rel_vocab, args.train, args.negative_size)
     val = TripletDataset(ent_vocab, rel_vocab, args.val, 0, train.graph)
 
-    model = ConvE(train.num_entities, train.num_relations)
+    if args.model == 'conve':
+        model = ConvE(train.num_entities, train.num_relations)
+    elif args.model == 'complex':
+        model = ComplEx(train.num_entities, train.num_relations)
+    else:
+        raise "no such model available: {}".format(args.model)
 
     if args.init_model:
         logger.info("initialize model with: {}".format(args.init_model))
