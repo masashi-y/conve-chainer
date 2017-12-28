@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 import argparse
-import collections
+from collections import defaultdict
 
 import numpy as np
 
@@ -43,7 +43,12 @@ class ConvE(chainer.Chain):
             self.bn1 = L.BatchNormalization(32)
             self.bn2 = L.BatchNormalization(self.embedding_dim)
 
-    def __call__(self, e1, rel, e2, Y):
+    def loss_fun(self, probs, Y):
+        losses = Y * F.log(probs) + (1 - Y) * F.log(1 - probs)
+        loss = - F.average(losses)
+        return loss
+
+    def __call__(self, e1, rel, e2, Y, flt):
         """
         Input:
             e1, rel, e2: ids for each entity and relation (shape : (batchsize,) )
@@ -51,31 +56,31 @@ class ConvE(chainer.Chain):
         Output:
             loss ( float )
         """
-        def loss_fun(probs):
-            losses = Y * F.log(probs) + (1 - Y) * F.log(1 - probs)
-            loss = - F.average(losses)
-            return loss
 
         if chainer.config.train:
             probs = self.forward(e1, rel, e2)
-            loss = loss_fun(probs)
+            loss = self.loss_fun(probs, Y)
             reporter.report({'loss': loss}, self)
             return loss
         else:
+            assert flt is not None
             batch_size, = e1.shape
             probs_all = self.forward(e1, rel, e2)
             rank_all = self.xp.argsort(-probs_all.data)
+            probs_all_flt = probs_all * flt
+            rank_all_flt = self.xp.argsort(-probs_all_flt.data)
             mrr = 0.
-            mr = 0.
+            mrr_flt = 0.
             for i in range(batch_size):
                 rank = self.xp.where(rank_all[i] == e2[i])[0][0] + 1
-                mr += rank
                 mrr += 1. / rank
-            mr /= float(batch_size)
+                rank_flt = self.xp.where(rank_all_flt[i] == e2[i])[0][0] + 1
+                mrr_flt += 1. / rank_flt
             mrr /= float(batch_size)
+            mrr_flt /= float(batch_size)
             probs = probs_all[self.xp.arange(batch_size), e2]
-            loss = loss_fun(probs)
-            reporter.report({'loss': loss, 'mr': mr, 'mrr': mrr}, self)
+            loss = self.loss_fun(probs, Y)
+            reporter.report({'loss': loss, 'mrr': mrr, 'mrr(flt)': mrr_flt}, self)
             return loss
 
     def forward(self, e1, rel, e2):
@@ -143,12 +148,21 @@ class Vocab(object):
 
 
 class TripletDataset(chainer.dataset.DatasetMixin):
-    def __init__(self, ent_vocab, rel_vocab, path, negative):
+    def __init__(self, ent_vocab, rel_vocab, path, negative, flt_graph=None):
         self.path = path
+        logger.info("creating TripletDataset for: {}".format(self.path))
         self.negative = negative
         self.entities = ent_vocab
         self.relations = rel_vocab
         self.data = []
+        if flt_graph is not None:
+            logger.info("filtered on")
+            self.filtered = True
+            self.graph = flt_graph
+        else:
+            logger.info("filtered off")
+            self.filtered = False
+            self.graph = defaultdict(list)
         self.load_from_path()
 
     def __len__(self):
@@ -162,6 +176,7 @@ class TripletDataset(chainer.dataset.DatasetMixin):
             id_e2 = self.entities[e2]
             id_rel = self.relations[rel]
             self.data.append((id_e1, id_rel, id_e2))
+            self.graph[id_e1, id_rel].append(id_e2)
         logger.info("done")
         self.num_entities = len(self.entities)
         self.num_relations = len(self.relations)
@@ -177,17 +192,31 @@ class TripletDataset(chainer.dataset.DatasetMixin):
         e1, rel, e2 = zip(*triplets)
         Y = np.zeros(1 + self.negative, 'i')
         Y[0] = 1
-        return e1, rel, e2, Y
+        if self.filtered:
+            e1_id, rel_id, e2_id = triplet
+            flt = np.ones(self.num_entities, 'f')
+            flt[self.graph[e1_id, rel_id]] = 0.
+            flt[e2_id] = 1.
+        else:
+            flt = None
+        return e1, rel, e2, Y, flt
 
 
 def convert(batch, device):
-    e1, rel, e2, Y = map(np.concatenate, zip(*batch))
+    e1, rel, e2, Y, flt = zip(*batch)
+    e1  = np.concatenate(e1)
+    rel = np.concatenate(rel)
+    e2  = np.concatenate(e2)
+    Y   = np.concatenate(Y)
+    flt = np.vstack(flt) if flt[0] is not None else None
     if device >= 0:
         e1  = cuda.to_gpu(e1)
         rel = cuda.to_gpu(rel)
         e2  = cuda.to_gpu(e2)
         Y   = cuda.to_gpu(Y)
-    return e1, rel, e2, Y
+        if flt is not None:
+            flt = cuda.to_gpu(flt)
+    return e1, rel, e2, Y, flt
 
 
 def main():
@@ -206,7 +235,7 @@ def main():
                         help='number of negative samples')
     parser.add_argument('--out', default='result',
                         help='Directory to output the result')
-    parser.add_argument('--val-iter', default=1000,
+    parser.add_argument('--val-iter', type=int, default=1000,
                         help='validation iteration')
     args = parser.parse_args()
 
@@ -226,7 +255,7 @@ def main():
     rel_vocab = Vocab.load(args.rel_vocab)
 
     train = TripletDataset(ent_vocab, rel_vocab, args.train, args.negative_size)
-    val = TripletDataset(ent_vocab, rel_vocab, args.val, 0)
+    val = TripletDataset(ent_vocab, rel_vocab, args.val, 0, train.graph)
 
     model = ConvE(train.num_entities, train.num_relations)
 
@@ -249,7 +278,7 @@ def main():
     trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=args.out)
 
     val_interval = args.val_iter, 'iteration'
-    log_interval = 100, 'iteration'
+    log_interval = 10, 'iteration'
 
     trainer.extend(extensions.Evaluator(val_iter, model,
         converter=convert, device=args.gpu), trigger=val_interval)
@@ -257,7 +286,7 @@ def main():
         model, 'model_iter_{.updater.iteration}'), trigger=val_interval)
     trainer.extend(extensions.LogReport(trigger=log_interval))
     trainer.extend(extensions.PrintReport(['epoch', 'main/loss',
-        'validation/main/loss', 'validation/main/mr', 'validation/main/mrr']), trigger=log_interval)
+        'validation/main/loss', 'validation/main/mrr', 'validation/main/mrr(flt)']), trigger=log_interval)
     trainer.extend(extensions.ProgressBar())
     trainer.run()
 
