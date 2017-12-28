@@ -277,7 +277,7 @@ def main():
     trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=args.out)
 
     val_interval = args.val_iter, 'iteration'
-    log_interval = 10, 'iteration'
+    log_interval = 100, 'iteration'
 
     trainer.extend(extensions.Evaluator(val_iter, model,
         converter=convert, device=args.gpu), trigger=val_interval)
