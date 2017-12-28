@@ -52,7 +52,7 @@ class ConvE(chainer.Chain):
             loss ( float )
         """
         def loss_fun(probs):
-            losses = Y * F.log(probs) + (1 - Y) * F.log(1 - probs)
+            losses = Y * F.log(probs + 1e-6) + (1 - Y) * F.log(1 - probs + 1e-6)
             loss = - F.average(losses)
             return loss
 
@@ -88,8 +88,6 @@ class ConvE(chainer.Chain):
         batch_size, = e1.shape
         e1_embedded = self.emb_e(e1).reshape(batch_size, 1, 10, 20)
         rel_embedded = self.emb_rel(rel).reshape(batch_size, 1, 10, 20)
-        e2_embedded = self.emb_e(e2)
-        bias = self.bias(e2).reshape((-1,))
 
         stacked_inputs = F.concat([e1_embedded, rel_embedded], axis=2)
         stacked_inputs = self.bn0(stacked_inputs)
@@ -104,6 +102,8 @@ class ConvE(chainer.Chain):
         x = self.bn2(x)
         x = F.relu(x)
         if chainer.config.train:
+            e2_embedded = self.emb_e(e2)
+            bias = self.bias(e2).reshape((-1,))
             x *= e2_embedded
             x = F.sum(x, axis=1) + bias
             pred = F.sigmoid(x)
@@ -181,13 +181,15 @@ class TripletDataset(chainer.dataset.DatasetMixin):
 
 
 def convert(batch, device):
-    e1, rel, e2, Y = map(np.concatenate, zip(*batch))
+    batch = map(np.concatenate, zip(*batch))
     if device >= 0:
-        e1  = cuda.to_gpu(e1)
-        rel = cuda.to_gpu(rel)
-        e2  = cuda.to_gpu(e2)
-        Y   = cuda.to_gpu(Y)
-    return e1, rel, e2, Y
+        batch = map(cuda.to_gpu, batch)
+        # e1  = cuda.to_gpu(e1)
+        # rel = cuda.to_gpu(rel)
+        # e2  = cuda.to_gpu(e2)
+        # Y   = cuda.to_gpu(Y)
+    return tuple(batch)
+    # return e1, rel, e2, Y
 
 
 def main():
@@ -234,7 +236,7 @@ def main():
         model.to_gpu()
 
     # Set up an optimizer
-    optimizer = O.Adam(alpha=0.003)
+    optimizer = O.Adam() # (alpha=0.003)
     optimizer.setup(model)
 
     # Set up an iterator
