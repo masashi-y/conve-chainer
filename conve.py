@@ -20,7 +20,115 @@ from chainer.training import extensions
 logger = logging.getLogger()
 logging.basicConfig(level=logging.INFO)
 
-class ConvE(chainer.Chain):
+
+class BaseModel(object):
+
+    def binary_cross_entropy(self, probs, Y):
+        losses = Y * F.log(probs + 1e-6) + (1 - Y) * F.log(1 - probs + 1e-6)
+        loss = - F.average(losses)
+        return loss
+
+    def evaluate(self, probs, e2, flt):
+        batch_size, = e2.shape
+        rank_all = self.xp.argsort(-probs.data)
+        probs_flt = probs * flt
+        rank_all_flt = self.xp.argsort(-probs_flt.data)
+        mrr = mrr_flt = hits1 = hits3 = hits10 = 0.
+        for i in range(batch_size):
+            rank = self.xp.where(rank_all[i] == e2[i])[0][0] + 1
+            mrr += 1. / rank
+            rank_flt = self.xp.where(rank_all_flt[i] == e2[i])[0][0] + 1
+            mrr_flt += 1. / rank_flt
+            if rank_flt <= 1:
+                hits1 += 1
+            if rank_flt <= 3:
+                hits3 += 1
+            if rank_flt <= 10:
+                hits10 += 1
+        mrr /= float(batch_size)
+        mrr_flt /= float(batch_size)
+        hits1 /= float(batch_size)
+        hits3 /= float(batch_size)
+        hits10 /= float(batch_size)
+        return {'mrr': mrr,
+                'mrr(flt)': mrr_flt,
+                'hits1(flt)': hits1,
+                'hits3(flt)': hits3,
+                'hits10(flt)': hits10}
+
+    def __call__(self, e1, rel, e2, Y, flt):
+        """
+        Input:
+            e1, rel, e2: ids for each entity and relation (shape : (batchsize,) )
+            Y: whether true (1) or negative (0) sample (shape : (batchsize,) )
+            flt: {0, 1} array used for filter evaluation (shape : (batch_size, num_entities) )
+        Output:
+            loss ( float )
+        """
+        if chainer.config.train:
+            probs = self.forward(e1, rel, e2)
+            loss = self.binary_cross_entropy(probs, Y)
+            reporter.report({'loss': loss}, self)
+            return loss
+        else:
+            assert flt is not None
+            batch_size, = e1.shape
+            probs_all = self.forward(e1, rel, e2)
+            metrics = self.evaluate(probs_all, e2, flt)
+            probs = probs_all[self.xp.arange(batch_size), e2]
+            loss = self.binary_cross_entropy(probs, Y)
+            metrics['loss'] = loss
+            reporter.report(metrics, self)
+            return loss
+
+
+class Complex(chainer.Chain, BaseModel):
+    def __init__(self, num_entities, num_relations, embedding_dim=200):
+        super(Complex, self).__init__()
+        self.num_entities = num_entities
+        self.num_relations = num_relations
+        self.embedding_dim = embedding_dim
+
+        with self.init_scope():
+            self.emb_e_real = L.EmbedID(
+                    num_entities, embedding_dim, initialW=I.GlorotNormal())
+            self.emb_e_img = L.EmbedID(
+                    num_entities, embedding_dim, initialW=I.GlorotNormal())
+            self.emb_rel_real = L.EmbedID(
+                    num_relations, embedding_dim, initialW=I.GlorotNormal())
+            self.emb_rel_img = L.EmbedID(
+                    num_relations, embedding_dim, initialW=I.GlorotNormal())
+
+    def forward(self, e1, rel, e2):
+        """
+        Input:
+            e1, rel, e2: ids for each entity and relation (shape : (batchsize,) )
+        Output:
+            score (shape : (batchsize,) )
+        """
+        batch_size, = e1.shape
+        e1_embedded_real = self.emb_e_real(e1).reshape(batch_size, -1)
+        rel_embedded_real = self.emb_rel_real(rel).reshape(batch_size, -1)
+        e2_embedded_real = self.emb_e_real(e2).reshape(batch_size, -1)
+        e1_embedded_img = self.emb_e_img(e1).reshape(batch_size, -1)
+        rel_embedded_img = self.emb_rel_img(rel).reshape(batch_size, -1)
+        e2_embedded_img = self.emb_e_img(e2).reshape(batch_size, -1)
+
+        e1_embedded_real = F.dropout(e1_embedded_real, 0.2)
+        rel_embedded_real = F.dropout(rel_embedded_real, 0.2)
+        e1_embedded_img = F.dropout(e1_embedded_img, 0.2)
+        rel_embedded_img = F.dropout(rel_embedded_img, 0.2)
+
+        realrealreal = e1_embedded_real * rel_embedded_real * e2_embedded_real
+        realimgimg = e1_embedded_real * rel_embedded_img * e2_embedded_img
+        imgrealimg = e1_embedded_img * rel_embedded_real * e2_embedded_img
+        imgimgreal = e1_embedded_img * rel_embedded_img * e2_embedded_real
+        pred = realrealreal + realimgimg + imgrealimg - imgimgreal
+        pred = F.sigmoid(F.sum(pred, 1))
+        return pred
+
+
+class ConvE(chainer.Chain, BaseModel):
 
     def __init__(self, num_entities, num_relations):
         super(ConvE, self).__init__()
@@ -39,59 +147,6 @@ class ConvE(chainer.Chain):
             self.bn0 = L.BatchNormalization(1)
             self.bn1 = L.BatchNormalization(32)
             self.bn2 = L.BatchNormalization(self.embedding_dim)
-
-    def loss_fun(self, probs, Y):
-        losses = Y * F.log(probs + 1e-6) + (1 - Y) * F.log(1 - probs + 1e-6)
-        loss = - F.average(losses)
-        return loss
-
-    def __call__(self, e1, rel, e2, Y, flt):
-        """
-        Input:
-            e1, rel, e2: ids for each entity and relation (shape : (batchsize,) )
-            Y: whether true (1) or negative (0) sample (shape : (batchsize,) )
-        Output:
-            loss ( float )
-        """
-        if chainer.config.train:
-            probs = self.forward(e1, rel, e2)
-            loss = self.loss_fun(probs, Y)
-            reporter.report({'loss': loss}, self)
-            return loss
-        else:
-            assert flt is not None
-            batch_size, = e1.shape
-            probs_all = self.forward(e1, rel, e2)
-            rank_all = self.xp.argsort(-probs_all.data)
-            probs_all_flt = probs_all * flt
-            rank_all_flt = self.xp.argsort(-probs_all_flt.data)
-            mrr = mrr_flt = hits1 = hits3 = hits10 = 0.
-            for i in range(batch_size):
-                rank = self.xp.where(rank_all[i] == e2[i])[0][0] + 1
-                mrr += 1. / rank
-                rank_flt = self.xp.where(rank_all_flt[i] == e2[i])[0][0] + 1
-                mrr_flt += 1. / rank_flt
-                if rank_flt <= 1:
-                    hits1 += 1
-                if rank_flt <= 3:
-                    hits3 += 1
-                if rank_flt <= 10:
-                    hits10 += 1
-            mrr /= float(batch_size)
-            mrr_flt /= float(batch_size)
-            hits1 /= float(batch_size)
-            hits3 /= float(batch_size)
-            hits10 /= float(batch_size)
-            probs = probs_all[self.xp.arange(batch_size), e2]
-            loss = self.loss_fun(probs, Y)
-            reporter.report({'loss': loss,
-                             'mrr': mrr,
-                             'mrr(flt)': mrr_flt,
-                             'hits1(flt)': hits1,
-                             'hits3(flt)': hits3,
-                             'hits10(flt)': hits10
-                             }, self)
-            return loss
 
     def forward(self, e1, rel, e2):
         """
