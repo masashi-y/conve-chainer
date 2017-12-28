@@ -7,6 +7,7 @@ import numpy as np
 import logging
 import chainer
 from chainer import cuda
+from chainer import serializers
 import chainer.functions as F
 import chainer.initializers as I
 import chainer.links as L
@@ -44,7 +45,7 @@ class ConvE(chainer.Chain):
             self.bn2 = L.BatchNormalization(self.embedding_dim)
 
     def loss_fun(self, probs, Y):
-        losses = Y * F.log(probs) + (1 - Y) * F.log(1 - probs)
+        losses = Y * F.log(probs + 1e-6) + (1 - Y) * F.log(1 - probs + 1e-6)
         loss = - F.average(losses)
         return loss
 
@@ -68,18 +69,32 @@ class ConvE(chainer.Chain):
             rank_all = self.xp.argsort(-probs_all.data)
             probs_all_flt = probs_all * flt
             rank_all_flt = self.xp.argsort(-probs_all_flt.data)
-            mrr = 0.
-            mrr_flt = 0.
+            mrr = mrr_flt = hits1 = hits3 = hits10 = 0.
             for i in range(batch_size):
                 rank = self.xp.where(rank_all[i] == e2[i])[0][0] + 1
                 mrr += 1. / rank
                 rank_flt = self.xp.where(rank_all_flt[i] == e2[i])[0][0] + 1
                 mrr_flt += 1. / rank_flt
+                if rank_flt <= 1:
+                    hits1 += 1
+                if rank_flt <= 3:
+                    hit3 += 1
+                if rank_flt <= 10:
+                    hit10 += 1
             mrr /= float(batch_size)
             mrr_flt /= float(batch_size)
+            hits1 /= float(batch_size)
+            hits2 /= float(batch_size)
+            hits10 /= float(batch_size)
             probs = probs_all[self.xp.arange(batch_size), e2]
             loss = self.loss_fun(probs, Y)
-            reporter.report({'loss': loss, 'mrr': mrr, 'mrr(flt)': mrr_flt}, self)
+            reporter.report({'loss': loss,
+                             'mrr': mrr,
+                             'mrr(flt)': mrr_flt,
+                             'hits1(flt)': hits1,
+                             'hits3(flt)': hits3,
+                             'hits10(flt)': hits10
+                             }, self)
             return loss
 
     def forward(self, e1, rel, e2):
@@ -236,6 +251,8 @@ def main():
                         help='Directory to output the result')
     parser.add_argument('--val-iter', type=int, default=1000,
                         help='validation iteration')
+    parser.add_argument('--init-model', default=None,
+                        help='initialize model with saved one')
     args = parser.parse_args()
 
     logger.info('train: {}'.format(args.train))
@@ -258,6 +275,9 @@ def main():
 
     model = ConvE(train.num_entities, train.num_relations)
 
+    if args.init_model:
+        logger.info("initialize model with: {}".format(args.init_model))
+        serializers.load_npz(args.init_model, model)
     if args.gpu >= 0:
         model.to_gpu()
 
@@ -285,7 +305,9 @@ def main():
         model, 'model_iter_{.updater.iteration}'), trigger=val_interval)
     trainer.extend(extensions.LogReport(trigger=log_interval))
     trainer.extend(extensions.PrintReport(['epoch', 'main/loss',
-        'validation/main/loss', 'validation/main/mrr', 'validation/main/mrr(flt)']), trigger=log_interval)
+        'validation/main/loss', 'validation/main/mrr', 'validation/main/mrr(flt)',
+        'validation/main/hits1(flt)', 'validation/main/hits3(flt)',
+        'validation/main/hits10(flt)']), trigger=log_interval)
     trainer.extend(extensions.ProgressBar())
     trainer.run()
 
