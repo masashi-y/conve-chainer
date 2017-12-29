@@ -180,19 +180,21 @@ class ConvE(chainer.Chain, BaseModel):
         x = F.dropout(x, 0.3)
         x = self.bn2(x)
         x = F.relu(x)
+        # if chainer.config.train:
+        #     e2_embedded = self.emb_e(e2)
+        #     bias = self.bias(e2).reshape((-1,))
+        #     x *= e2_embedded
+        #     x = F.sum(x, axis=1) + bias
+        #     pred = F.sigmoid(x)
+        #     return pred
+        # else:
+        x = F.matmul(x, self.emb_e.W, transb=True)
+        x, bias = F.broadcast(x, self.bias.W.T)
+        x += bias
+        pred = F.sigmoid(x)
         if chainer.config.train:
-            e2_embedded = self.emb_e(e2)
-            bias = self.bias(e2).reshape((-1,))
-            x *= e2_embedded
-            x = F.sum(x, axis=1) + bias
-            pred = F.sigmoid(x)
-            return pred
-        else:
-            x = F.matmul(x, self.emb_e.W, transb=True)
-            x, bias = F.broadcast(x, self.bias.W.T)
-            x += bias
-            pred = F.sigmoid(x)
-            return pred
+            pred = pred.reshape((-1,))
+        return pred
 
 
 class Vocab(object):
@@ -254,6 +256,7 @@ class TripletDataset(chainer.dataset.DatasetMixin):
         logger.info("done")
         self.num_entities = len(self.entities)
         self.num_relations = len(self.relations)
+        logger.info("num samples: {}".format(len(self)))
         logger.info("num entities: {}".format(self.num_entities))
         logger.info("num relations: {}".format(self.num_relations))
 
@@ -273,6 +276,46 @@ class TripletDataset(chainer.dataset.DatasetMixin):
             flt[e2_id] = 1.
         else:
             flt = None
+        return e1, rel, e2, Y, flt
+
+
+class WrangleTripletDataset(chainer.dataset.DatasetMixin):
+    def __init__(self, ent_vocab, rel_vocab, path):
+        self.path = path
+        logger.info("creating WrangleTripletDataset for: {}".format(self.path))
+        self.entities = ent_vocab
+        self.relations = rel_vocab
+        self.data = []
+        self.graph = defaultdict(list)
+        self.load_from_path()
+
+    def __len__(self):
+        return len(self.data)
+
+    def load_from_path(self):
+        logger.info("start loading dataset")
+        for line in open(self.path):
+            e1, rel, e2 = line.strip().split("\t")
+            id_e1 = self.entities[e1]
+            id_e2 = self.entities[e2]
+            id_rel = self.relations[rel]
+            self.graph[id_e1, id_rel].append(id_e2)
+        self.data.extend(list(self.graph.items()))
+        logger.info("done")
+        self.num_entities = len(self.entities)
+        self.num_relations = len(self.relations)
+        logger.info("num samples: {}".format(len(self)))
+        logger.info("num entities: {}".format(self.num_entities))
+        logger.info("num relations: {}".format(self.num_relations))
+
+    def get_example(self, i):
+        (e1, rel), e2 = self.data[i]
+        e1 = np.array([e1], 'i')
+        rel = np.array([rel], 'i')
+        e2 = np.array(e2, 'i')
+        Y = np.zeros(self.num_entities, 'i')
+        Y[e2] = 1
+        flt = None
         return e1, rel, e2, Y, flt
 
 
@@ -338,7 +381,8 @@ def main():
     ent_vocab = Vocab.load(args.ent_vocab)
     rel_vocab = Vocab.load(args.rel_vocab)
 
-    train = TripletDataset(ent_vocab, rel_vocab, args.train, args.negative_size)
+    # train = TripletDataset(ent_vocab, rel_vocab, args.train, args.negative_size)
+    train = WrangleTripletDataset(ent_vocab, rel_vocab, args.train)
     val = TripletDataset(ent_vocab, rel_vocab, args.val, 0, train.graph)
 
     if args.model == 'conve':
