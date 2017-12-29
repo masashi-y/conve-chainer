@@ -24,11 +24,26 @@ logging.basicConfig(level=logging.INFO)
 class BaseModel(object):
 
     def binary_cross_entropy(self, probs, Y):
+        """
+        Input:
+            probs: probability matrix in any shape
+            Y {0, 1} matrix in the same shape as probs
+        Output:
+            scalar loss
+        """
         losses = Y * F.log(probs + 1e-6) + (1 - Y) * F.log(1 - probs + 1e-6)
         loss = - F.average(losses)
         return loss
 
     def evaluate(self, probs, e2, flt):
+        """
+        Input:
+            probs: probability matrix (shape: (batch_size, num_entities) )
+            e2: gold e2's (shape: (batch_size,) )
+            flt: {0,1} filters for filtered scores (shape: (batch_size, num_entities) )
+        Output:
+            MRR, filtered MRR, filtered HITs (1, 3, 10)
+        """
         batch_size, = e2.shape
         rank_all = self.xp.argsort(-probs.data)
         probs_flt = probs * flt
@@ -73,7 +88,7 @@ class BaseModel(object):
         else:
             assert flt is not None
             batch_size, = e1.shape
-            probs_all = self.forward(e1, rel, e2)
+            probs_all = self.forward(e1, rel, None)
             metrics = self.evaluate(probs_all, e2, flt)
             probs = probs_all[self.xp.arange(batch_size), e2]
             loss = self.binary_cross_entropy(probs, Y)
@@ -83,6 +98,9 @@ class BaseModel(object):
 
 
 class ComplEx(chainer.Chain, BaseModel):
+    """
+    Complex Embeddings for Simple Link Prediction, Théo Trouillon et al., 2016
+    """
     def __init__(self, num_entities, num_relations, embedding_dim=200):
         super(ComplEx, self).__init__()
         self.num_entities = num_entities
@@ -99,7 +117,7 @@ class ComplEx(chainer.Chain, BaseModel):
             self.emb_rel_img = L.EmbedID(
                     num_relations, embedding_dim, initialW=I.GlorotNormal())
 
-    def forward(self, e1, rel, e2):
+    def forward(self, e1, rel, e2=None):
         """
         Input:
             e1, rel, e2: ids for each entity and relation (shape : (batchsize,) )
@@ -117,7 +135,7 @@ class ComplEx(chainer.Chain, BaseModel):
         e1_embedded_img = F.dropout(e1_embedded_img, 0.2)
         rel_embedded_img = F.dropout(rel_embedded_img, 0.2)
 
-        if not chainer.config.train:
+        if e2 is not None:
             e2_embedded_real = self.emb_e_real(e2).reshape(batch_size, -1)
             e2_embedded_img = self.emb_e_img(e2).reshape(batch_size, -1)
             realrealreal = e1_embedded_real * rel_embedded_real * e2_embedded_real
@@ -138,7 +156,9 @@ class ComplEx(chainer.Chain, BaseModel):
 
 
 class ConvE(chainer.Chain, BaseModel):
-
+    """
+    Convolutional 2D Knowledge Graph Embeddings, Tim Dettmers et al., 2017
+    """
     def __init__(self, num_entities, num_relations):
         super(ConvE, self).__init__()
         self.num_entities = num_entities
@@ -157,7 +177,7 @@ class ConvE(chainer.Chain, BaseModel):
             self.bn1 = L.BatchNormalization(32)
             self.bn2 = L.BatchNormalization(self.embedding_dim)
 
-    def forward(self, e1, rel, e2):
+    def forward(self, e1, rel, e2=None):
         """
         Input:
             e1, rel, e2: ids for each entity and relation (shape : (batchsize,) )
@@ -180,7 +200,7 @@ class ConvE(chainer.Chain, BaseModel):
         x = F.dropout(x, 0.3)
         x = self.bn2(x)
         x = F.relu(x)
-        if not chainer.config.train:
+        if e2 is not None:
             e2_embedded = self.emb_e(e2)
             bias = self.bias(e2).reshape((-1,))
             x *= e2_embedded
@@ -192,6 +212,8 @@ class ConvE(chainer.Chain, BaseModel):
             x, bias = F.broadcast(x, self.bias.W.T)
             x += bias
             pred = F.sigmoid(x)
+            if chainer.config.train:
+                pred = pred.reshape((-1,))
             return pred
 
 
@@ -254,6 +276,7 @@ class TripletDataset(chainer.dataset.DatasetMixin):
         logger.info("done")
         self.num_entities = len(self.entities)
         self.num_relations = len(self.relations)
+        logger.info("num samples: {}".format(len(self)))
         logger.info("num entities: {}".format(self.num_entities))
         logger.info("num relations: {}".format(self.num_relations))
 
@@ -273,6 +296,51 @@ class TripletDataset(chainer.dataset.DatasetMixin):
             flt[e2_id] = 1.
         else:
             flt = None
+        return e1, rel, e2, Y, flt
+
+
+class FastEvalTripletDataset(chainer.dataset.DatasetMixin):
+    """
+    Dataset to perform the technique in:
+      4.1 Fast Evaluation for Link Prediction Tasks
+      (Convolutional 2D Knowledge Graph Embeddings, Tim Dettmers et al.)
+    """
+    def __init__(self, ent_vocab, rel_vocab, path):
+        self.path = path
+        logger.info("creating FastEvalTripletDataset for: {}".format(self.path))
+        self.entities = ent_vocab
+        self.relations = rel_vocab
+        self.data = []
+        self.graph = defaultdict(list)
+        self.load_from_path()
+
+    def __len__(self):
+        return len(self.data)
+
+    def load_from_path(self):
+        logger.info("start loading dataset")
+        for line in open(self.path):
+            e1, rel, e2 = line.strip().split("\t")
+            id_e1 = self.entities[e1]
+            id_e2 = self.entities[e2]
+            id_rel = self.relations[rel]
+            self.graph[id_e1, id_rel].append(id_e2)
+        self.data.extend(list(self.graph.items()))
+        logger.info("done")
+        self.num_entities = len(self.entities)
+        self.num_relations = len(self.relations)
+        logger.info("num samples: {}".format(len(self)))
+        logger.info("num entities: {}".format(self.num_entities))
+        logger.info("num relations: {}".format(self.num_relations))
+
+    def get_example(self, i):
+        (e1, rel), e2 = self.data[i]
+        e1 = np.array([e1], 'i')
+        rel = np.array([rel], 'i')
+        e2 = np.array(e2, 'i')
+        Y = np.zeros(self.num_entities, 'i')
+        Y[e2] = 1
+        flt = None
         return e1, rel, e2, Y, flt
 
 
@@ -338,7 +406,10 @@ def main():
     ent_vocab = Vocab.load(args.ent_vocab)
     rel_vocab = Vocab.load(args.rel_vocab)
 
-    train = TripletDataset(ent_vocab, rel_vocab, args.train, args.negative_size)
+    if args.model == 'conve':
+        train = FastEvalTripletDataset(ent_vocab, rel_vocab, args.train)
+    else:
+        train = TripletDataset(ent_vocab, rel_vocab, args.train, args.negative_size)
     val = TripletDataset(ent_vocab, rel_vocab, args.val, 0, train.graph)
 
     if args.model == 'conve':
@@ -354,19 +425,15 @@ def main():
     if args.gpu >= 0:
         model.to_gpu()
 
-    # Set up an optimizer
     optimizer = O.Adam() # (alpha=0.003)
     optimizer.setup(model)
 
-    # Set up an iterator
     train_iter = chainer.iterators.SerialIterator(train, args.batchsize)
     val_iter = chainer.iterators.SerialIterator(val, args.batchsize, repeat=False)
 
-    # Set up an updater
     updater = training.StandardUpdater(
         train_iter, optimizer, converter=convert, device=args.gpu)
 
-    # Set up a trainer
     trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=args.out)
 
     val_interval = args.val_iter, 'iteration'
