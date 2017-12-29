@@ -117,7 +117,7 @@ class ComplEx(chainer.Chain, BaseModel):
         e1_embedded_img = F.dropout(e1_embedded_img, 0.2)
         rel_embedded_img = F.dropout(rel_embedded_img, 0.2)
 
-        if chainer.config.train:
+        if not chainer.config.train:
             e2_embedded_real = self.emb_e_real(e2).reshape(batch_size, -1)
             e2_embedded_img = self.emb_e_img(e2).reshape(batch_size, -1)
             realrealreal = e1_embedded_real * rel_embedded_real * e2_embedded_real
@@ -180,7 +180,7 @@ class ConvE(chainer.Chain, BaseModel):
         x = F.dropout(x, 0.3)
         x = self.bn2(x)
         x = F.relu(x)
-        if chainer.config.train:
+        if not chainer.config.train:
             e2_embedded = self.emb_e(e2)
             bias = self.bias(e2).reshape((-1,))
             x *= e2_embedded
