@@ -4,7 +4,7 @@ from collections import defaultdict
 
 import numpy as np
 import os
-
+from tqdm import tqdm
 import logging
 import chainer
 from chainer import cuda
@@ -22,6 +22,9 @@ logging.basicConfig(level=logging.INFO)
 
 
 class BaseModel(object):
+    def __init__(self, fast_eval):
+        self.__call__ = self.call_fast_evaluation if fast_eval \
+                            else self.call_negative_sampling
 
     def binary_cross_entropy(self, probs, Y):
         """
@@ -71,7 +74,7 @@ class BaseModel(object):
                 'hits3(flt)': hits3,
                 'hits10(flt)': hits10}
 
-    def __call__(self, e1, rel, e2, Y, flt):
+    def call_negative_sampling(self, e1, rel, e2, Y, flt):
         """
         Input:
             e1, rel, e2: ids for each entity and relation (shape : (batchsize,) )
@@ -96,13 +99,80 @@ class BaseModel(object):
             reporter.report(metrics, self)
             return loss
 
+    def call_fast_evaluation(self, e1, rel, e2, Y, flt):
+        """
+        Input:
+            e1, rel, e2: ids for each entity and relation (shape : (batchsize,) )
+            Y: whether true (1) or negative (0) sample (shape : (batchsize,) )
+            flt: {0, 1} array used for filter evaluation (shape : (batch_size, num_entities) )
+        Output:
+            loss ( float )
+        """
+        if chainer.config.train:
+            probs = self.forward(e1, rel)
+            probs = probs.reshape((-1,))
+            loss = self.binary_cross_entropy(probs, Y)
+            reporter.report({'loss': loss}, self)
+            return loss
+        else:
+            assert flt is not None
+            batch_size, = e1.shape
+            probs_all = self.forward(e1, rel, None)
+            metrics = self.evaluate(probs_all, e2, flt)
+            probs = probs_all[self.xp.arange(batch_size), e2]
+            loss = self.binary_cross_entropy(probs, Y)
+            metrics['loss'] = loss
+            reporter.report(metrics, self)
+            return loss
+
+
+class DistMult(chainer.Chain, BaseModel):
+    """
+    DistMult
+    """
+    def __init__(self, num_entities, num_relations, fast_eval, embedding_dim=200):
+        super(DistMult, self).__init__(fast_eval)
+        self.num_entities = num_entities
+        self.num_relations = num_relations
+        self.embedding_dim = embedding_dim
+
+        with self.init_scope():
+            self.emb_e = L.EmbedID(
+                    num_entities, embedding_dim, initialW=I.GlorotNormal())
+            self.emb_rel = L.EmbedID(
+                    num_relations, embedding_dim, initialW=I.GlorotNormal())
+
+    def forward(self, e1, rel, e2=None):
+        """
+        Input:
+            e1, rel, e2: ids for each entity and relation (shape : (batchsize,) )
+        Output:
+            score (shape : (batchsize,) )
+        """
+        batch_size, = e1.shape
+        e1_embedded = self.emb_e(e1)
+        rel_embedded = self.emb_rel(rel)
+
+        e1_embedded = F.dropout(e1_embedded, 0.2)
+        rel_embedded = F.dropout(rel_embedded, 0.2)
+
+        if e2 is not None:
+            e2_embedded = self.emb_e(e2)
+            pred = e1_embedded * rel_embedded * e2_embedded
+            pred = F.sigmoid(F.sum(pred, 1))
+            return pred
+        else:
+            pred = F.matmul(e1_embedded * rel_embedded, self.emb_e.W, transb=True)
+            pred = F.sigmoid(pred)
+            return pred
+
 
 class ComplEx(chainer.Chain, BaseModel):
     """
     Complex Embeddings for Simple Link Prediction, Théo Trouillon et al., 2016
     """
-    def __init__(self, num_entities, num_relations, embedding_dim=200):
-        super(ComplEx, self).__init__()
+    def __init__(self, num_entities, num_relations, fast_eval, embedding_dim=200):
+        super(ComplEx, self).__init__(fast_eval)
         self.num_entities = num_entities
         self.num_relations = num_relations
         self.embedding_dim = embedding_dim
@@ -136,8 +206,8 @@ class ComplEx(chainer.Chain, BaseModel):
         rel_embedded_img = F.dropout(rel_embedded_img, 0.2)
 
         if e2 is not None:
-            e2_embedded_real = self.emb_e_real(e2).reshape(batch_size, -1)
-            e2_embedded_img = self.emb_e_img(e2).reshape(batch_size, -1)
+            e2_embedded_real = self.emb_e_real(e2)
+            e2_embedded_img = self.emb_e_img(e2)
             realrealreal = e1_embedded_real * rel_embedded_real * e2_embedded_real
             realimgimg = e1_embedded_real * rel_embedded_img * e2_embedded_img
             imgrealimg = e1_embedded_img * rel_embedded_real * e2_embedded_img
@@ -159,8 +229,8 @@ class ConvE(chainer.Chain, BaseModel):
     """
     Convolutional 2D Knowledge Graph Embeddings, Tim Dettmers et al., 2017
     """
-    def __init__(self, num_entities, num_relations):
-        super(ConvE, self).__init__()
+    def __init__(self, num_entities, num_relations, fast_eval):
+        super(ConvE, self).__init__(fast_eval)
         self.num_entities = num_entities
         self.num_relations = num_relations
         self.embedding_dim = 200
@@ -212,8 +282,6 @@ class ConvE(chainer.Chain, BaseModel):
             x, bias = F.broadcast(x, self.bias.W.T)
             x += bias
             pred = F.sigmoid(x)
-            if chainer.config.train:
-                pred = pred.reshape((-1,))
             return pred
 
 
@@ -305,13 +373,14 @@ class FastEvalTripletDataset(chainer.dataset.DatasetMixin):
       4.1 Fast Evaluation for Link Prediction Tasks
       (Convolutional 2D Knowledge Graph Embeddings, Tim Dettmers et al.)
     """
-    def __init__(self, ent_vocab, rel_vocab, path):
+    def __init__(self, ent_vocab, rel_vocab, path, expand_graph=True):
         self.path = path
         logger.info("creating FastEvalTripletDataset for: {}".format(self.path))
         self.entities = ent_vocab
         self.relations = rel_vocab
         self.data = []
         self.graph = defaultdict(list)
+        self.expand_graph = expand_graph
         self.load_from_path()
 
     def __len__(self):
@@ -332,6 +401,28 @@ class FastEvalTripletDataset(chainer.dataset.DatasetMixin):
         logger.info("num samples: {}".format(len(self)))
         logger.info("num entities: {}".format(self.num_entities))
         logger.info("num relations: {}".format(self.num_relations))
+
+        if self.expand_graph:
+            graph0 = defaultdict(list)
+            trans = [self.relations[s] for s in ["hypernyms", "hyponyms"]]
+            for id_e1, id_rel in tqdm(self.graph, desc="extending graph"):
+                if id_rel not in trans:
+                    graph0[id_e1, id_rel] = self.graph[id_e1, id_rel]
+                    continue
+
+                res = []
+                def traverse(e1, rel, depth):
+                    res.append(e1)
+                    if depth <= 0: return
+                    if (e1, rel) in self.graph:
+                        for e2 in self.graph[e1, rel]:
+                            traverse(e2, rel, depth - 1)
+
+                for e2 in self.graph[id_e1, id_rel]:
+                    traverse(e2, id_rel, 50)
+                graph0[id_e1, id_rel] = list(set(res))
+            self.graph = graph0
+            self.data = list(graph0.items())
 
     def get_example(self, i):
         (e1, rel), e2 = self.data[i]
@@ -367,7 +458,8 @@ def main():
     parser.add_argument('val', help='Path to validation triplet list file')
     parser.add_argument('ent_vocab', help='Path to entity vocab')
     parser.add_argument('rel_vocab', help='Path to relation vocab')
-    parser.add_argument('--model', default='conve', choices=['complex', 'conve'])
+    parser.add_argument('--model', default='conve',
+                    choices=['complex', 'conve', 'distmult'])
     parser.add_argument('--gpu', '-g', default=-1, type=int,
                         help='GPU ID (negative value indicates CPU)')
     parser.add_argument('--batchsize', '-b', type=int, default=1000,
@@ -382,8 +474,12 @@ def main():
                         help='validation iteration')
     parser.add_argument('--init-model', default=None,
                         help='initialize model with saved one')
+    parser.add_argument('--expand-graph', action='store_true')
+    parser.add_argument('--fast-eval', action='store_true')
     args = parser.parse_args()
 
+    if not os.path.exists(args.out):
+        os.mkdir(args.out)
     log_path = os.path.join(args.out, 'loginfo')
     file_handler = logging.FileHandler(log_path)
     fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
@@ -406,16 +502,18 @@ def main():
     ent_vocab = Vocab.load(args.ent_vocab)
     rel_vocab = Vocab.load(args.rel_vocab)
 
-    if args.model == 'conve':
-        train = FastEvalTripletDataset(ent_vocab, rel_vocab, args.train)
+    if args.fast_eval:
+        train = FastEvalTripletDataset(ent_vocab, rel_vocab, args.train, args.expand_graph)
     else:
         train = TripletDataset(ent_vocab, rel_vocab, args.train, args.negative_size)
     val = TripletDataset(ent_vocab, rel_vocab, args.val, 0, train.graph)
 
     if args.model == 'conve':
-        model = ConvE(train.num_entities, train.num_relations)
+        model = ConvE(train.num_entities, train.num_relations, args.fast_eval)
     elif args.model == 'complex':
-        model = ComplEx(train.num_entities, train.num_relations)
+        model = ComplEx(train.num_entities, train.num_relations, args.fast_eval)
+    elif args.model == 'distmult':
+        model = DistMult(train.num_entities, train.num_relations, args.fast_eval)
     else:
         raise "no such model available: {}".format(args.model)
 
