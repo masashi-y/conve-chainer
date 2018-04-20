@@ -22,10 +22,6 @@ logging.basicConfig(level=logging.INFO)
 
 
 class BaseModel(object):
-    def __init__(self, fast_eval):
-        self.__call__ = self.call_fast_evaluation if fast_eval \
-                            else self.call_negative_sampling
-
     def binary_cross_entropy(self, probs, Y):
         """
         Input:
@@ -73,6 +69,12 @@ class BaseModel(object):
                 'hits1(flt)': hits1,
                 'hits3(flt)': hits3,
                 'hits10(flt)': hits10}
+
+    def __call__(self, e1, rel, e2, Y, flt):
+        if self.fast_eval:
+            return self.call_fast_evaluation(e1, rel, e2, Y, flt)
+        else:
+            return self.call_negative_sampling(e1, rel, e2, Y, flt)
 
     def call_negative_sampling(self, e1, rel, e2, Y, flt):
         """
@@ -131,7 +133,8 @@ class DistMult(chainer.Chain, BaseModel):
     DistMult
     """
     def __init__(self, num_entities, num_relations, fast_eval, embedding_dim=200):
-        super(DistMult, self).__init__(fast_eval)
+        super(DistMult, self).__init__()
+        self.fast_eval = fast_eval
         self.num_entities = num_entities
         self.num_relations = num_relations
         self.embedding_dim = embedding_dim
@@ -172,7 +175,8 @@ class ComplEx(chainer.Chain, BaseModel):
     Complex Embeddings for Simple Link Prediction, Théo Trouillon et al., 2016
     """
     def __init__(self, num_entities, num_relations, fast_eval, embedding_dim=200):
-        super(ComplEx, self).__init__(fast_eval)
+        super(ComplEx, self).__init__()
+        self.fast_eval = fast_eval
         self.num_entities = num_entities
         self.num_relations = num_relations
         self.embedding_dim = embedding_dim
@@ -230,7 +234,8 @@ class ConvE(chainer.Chain, BaseModel):
     Convolutional 2D Knowledge Graph Embeddings, Tim Dettmers et al., 2017
     """
     def __init__(self, num_entities, num_relations, fast_eval):
-        super(ConvE, self).__init__(fast_eval)
+        super(ConvE, self).__init__()
+        self.fast_eval = fast_eval
         self.num_entities = num_entities
         self.num_relations = num_relations
         self.embedding_dim = 200
@@ -404,7 +409,8 @@ class FastEvalTripletDataset(chainer.dataset.DatasetMixin):
 
         if self.expand_graph:
             graph0 = defaultdict(list)
-            trans = [self.relations[s] for s in ["hypernyms", "hyponyms"]]
+            # trans = [self.relations[s] for s in ["hypernyms", "hyponyms"]]
+            trans = [self.relations[s] for s in ["_hypernym", "_instance_hypernym"]]
             for id_e1, id_rel in tqdm(self.graph, desc="extending graph"):
                 if id_rel not in trans:
                     graph0[id_e1, id_rel] = self.graph[id_e1, id_rel]
