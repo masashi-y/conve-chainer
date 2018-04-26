@@ -3,7 +3,7 @@ import argparse
 from collections import defaultdict
 
 import numpy as np
-import os
+import os, sys
 from tqdm import tqdm
 import logging
 import chainer
@@ -44,9 +44,9 @@ class Evaluator(object):
         rank_all_flt = xp.argsort(-probs_flt.data)
         for i in range(batch_size):
             rank = xp.where(rank_all[i] == e2[i])[0][0] + 1
-            self.mrr += 1. / rank
+            self.mrr += 1. / int(rank)
             rank_flt = xp.where(rank_all_flt[i] == e2[i])[0][0] + 1
-            self.mrr_flt += 1. / rank_flt
+            self.mrr_flt += 1. / int(rank_flt)
             if rank_flt <= 1:
                 self.hits1 += 1
             if rank_flt <= 3:
@@ -57,6 +57,7 @@ class Evaluator(object):
 
     def results(self):
         total = float(self.total)
+        print(total)
         mrr = self.mrr / total
         mrr_flt = self.mrr_flt / total
         hits1 = self.hits1 / total
@@ -560,6 +561,8 @@ def main():
     @chainer.training.make_extension()
     def evaluate(trainer):
         evaluator = Evaluator()
+        if hasattr(val_iter, 'reset'):
+            val_iter.reset()
         for batch in val_iter:
             e1, rel, e2, _, flt = convert(batch, args.gpu)
             probs = model.forward(e1, rel, None)
