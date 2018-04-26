@@ -20,6 +20,54 @@ from chainer.training import extensions
 logger = logging.getLogger()
 logging.basicConfig(level=logging.INFO)
 
+class Evaluator(object):
+    def __init__(self):
+        self.total = 0
+        self.mrr = 0.
+        self.mrr_flt = 0.
+        self.hits1 = 0.
+        self.hits3 = 0.
+        self.hits10 = 0.
+
+    def process_batch(self, probs, e2, flt):
+        """
+        Input:
+            probs: probability matrix (shape: (batch_size, num_entities) )
+            e2: gold e2's (shape: (batch_size,) )
+            flt: {0,1} filters for filtered scores (shape: (batch_size, num_entities) )
+        Output:
+            MRR, filtered MRR, filtered HITs (1, 3, 10)
+        """
+        batch_size, = e2.shape
+        rank_all = self.xp.argsort(-probs.data)
+        probs_flt = probs * flt
+        rank_all_flt = self.xp.argsort(-probs_flt.data)
+        for i in range(batch_size):
+            rank = self.xp.where(rank_all[i] == e2[i])[0][0] + 1
+            self.mrr += 1. / rank
+            rank_flt = self.xp.where(rank_all_flt[i] == e2[i])[0][0] + 1
+            self.mrr_flt += 1. / rank_flt
+            if rank_flt <= 1:
+                self.hits1 += 1
+            if rank_flt <= 3:
+                self.hits3 += 1
+            if rank_flt <= 10:
+                self.hits10 += 1
+        self.total += batch_size
+
+    def results(self):
+        total = float(self.total)
+        mrr = self.mrr / total
+        mrr_flt = self.mrr_flt / total
+        hits1 = self.hits1 / total
+        hits3 = self.hits3 / total
+        hits10 = self.hits10 / total
+        return {'mrr': mrr,
+                'mrr(flt)': mrr_flt,
+                'hits1(flt)': hits1,
+                'hits3(flt)': hits3,
+                'hits10(flt)': hits10}
+
 
 class BaseModel(object):
     def binary_cross_entropy(self, probs, Y):
@@ -33,42 +81,6 @@ class BaseModel(object):
         losses = Y * F.log(probs + 1e-6) + (1 - Y) * F.log(1 - probs + 1e-6)
         loss = - F.average(losses)
         return loss
-
-    def evaluate(self, probs, e2, flt):
-        """
-        Input:
-            probs: probability matrix (shape: (batch_size, num_entities) )
-            e2: gold e2's (shape: (batch_size,) )
-            flt: {0,1} filters for filtered scores (shape: (batch_size, num_entities) )
-        Output:
-            MRR, filtered MRR, filtered HITs (1, 3, 10)
-        """
-        batch_size, = e2.shape
-        rank_all = self.xp.argsort(-probs.data)
-        probs_flt = probs * flt
-        rank_all_flt = self.xp.argsort(-probs_flt.data)
-        mrr = mrr_flt = hits1 = hits3 = hits10 = 0.
-        for i in range(batch_size):
-            rank = self.xp.where(rank_all[i] == e2[i])[0][0] + 1
-            mrr += 1. / rank
-            rank_flt = self.xp.where(rank_all_flt[i] == e2[i])[0][0] + 1
-            mrr_flt += 1. / rank_flt
-            if rank_flt <= 1:
-                hits1 += 1
-            if rank_flt <= 3:
-                hits3 += 1
-            if rank_flt <= 10:
-                hits10 += 1
-        mrr /= float(batch_size)
-        mrr_flt /= float(batch_size)
-        hits1 /= float(batch_size)
-        hits3 /= float(batch_size)
-        hits10 /= float(batch_size)
-        return {'mrr': mrr,
-                'mrr(flt)': mrr_flt,
-                'hits1(flt)': hits1,
-                'hits3(flt)': hits3,
-                'hits10(flt)': hits10}
 
     def __call__(self, e1, rel, e2, Y, flt):
         if self.fast_eval:
@@ -94,7 +106,9 @@ class BaseModel(object):
             assert flt is not None
             batch_size, = e1.shape
             probs_all = self.forward(e1, rel, None)
-            metrics = self.evaluate(probs_all, e2, flt)
+            evaluator = Evaluator()
+            evaluator.process_batch(probs_all, e2, flt)
+            metrics = evaluator.results()
             probs = probs_all[self.xp.arange(batch_size), e2]
             loss = self.binary_cross_entropy(probs, Y)
             metrics['loss'] = loss
@@ -120,7 +134,9 @@ class BaseModel(object):
             assert flt is not None
             batch_size, = e1.shape
             probs_all = self.forward(e1, rel, None)
-            metrics = self.evaluate(probs_all, e2, flt)
+            evaluator = Evaluator()
+            evaluator.process_batch(probs_all, e2, flt)
+            metrics = evaluator.results()
             probs = probs_all[self.xp.arange(batch_size), e2]
             loss = self.binary_cross_entropy(probs, Y)
             metrics['loss'] = loss
@@ -534,28 +550,22 @@ def main():
     train_iter = chainer.iterators.SerialIterator(train, args.batchsize)
     val_iter = chainer.iterators.SerialIterator(val, args.batchsize, repeat=False)
 
-    @chainer.training.make_extension()
-    def evaluate(trainer):
-        probs = []
-        e2s = []
-        flts = []
-        for batch in val_iter:
-            e1, rel, e2, _, flt = convert(batch, args.gpu)
-            with chainer.no_backprop_mode(), chainer.using_config('train', False):
-                prob = model.forward(e1, rel, None)
-            probs.append(prob)
-            e2s.append(e2)
-            flts.append(flt)
-        metrics = model.evaluate(F.concat(probs, axis=0),
-                F.concat(e2s, axis=0), F.concat(flts, axis=0))
-        print(metrics, file=sys.stderr)
-
     updater = training.StandardUpdater(
         train_iter, optimizer, converter=convert, device=args.gpu)
     trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=args.out)
 
     val_interval = args.val_iter, 'iteration'
     log_interval = 100, 'iteration'
+
+    @chainer.training.make_extension()
+    def translate(trainer):
+        evaluator = Evaluator()
+        for batch in val_iter:
+            e1, rel, e2, _, flt = convert(batch, args.gpu)
+            probs = model.forward(e1, rel, None)
+            evaluator.process_batch(probs, e2, flt)
+        metrics = evaluator.results()
+        print(metrics, file=sys.stderr)
 
     trainer.extend(evaluate, trigger=val_interval)
     trainer.extend(extensions.snapshot_object(
