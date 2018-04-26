@@ -29,7 +29,7 @@ class Evaluator(object):
         self.hits3 = 0.
         self.hits10 = 0.
 
-    def process_batch(self, probs, e2, flt):
+    def process_batch(self, xp, probs, e2, flt):
         """
         Input:
             probs: probability matrix (shape: (batch_size, num_entities) )
@@ -39,13 +39,13 @@ class Evaluator(object):
             MRR, filtered MRR, filtered HITs (1, 3, 10)
         """
         batch_size, = e2.shape
-        rank_all = self.xp.argsort(-probs.data)
+        rank_all = xp.argsort(-probs.data)
         probs_flt = probs * flt
-        rank_all_flt = self.xp.argsort(-probs_flt.data)
+        rank_all_flt = xp.argsort(-probs_flt.data)
         for i in range(batch_size):
-            rank = self.xp.where(rank_all[i] == e2[i])[0][0] + 1
+            rank = xp.where(rank_all[i] == e2[i])[0][0] + 1
             self.mrr += 1. / rank
-            rank_flt = self.xp.where(rank_all_flt[i] == e2[i])[0][0] + 1
+            rank_flt = xp.where(rank_all_flt[i] == e2[i])[0][0] + 1
             self.mrr_flt += 1. / rank_flt
             if rank_flt <= 1:
                 self.hits1 += 1
@@ -107,7 +107,7 @@ class BaseModel(object):
             batch_size, = e1.shape
             probs_all = self.forward(e1, rel, None)
             evaluator = Evaluator()
-            evaluator.process_batch(probs_all, e2, flt)
+            evaluator.process_batch(self.xp, probs_all, e2, flt)
             metrics = evaluator.results()
             probs = probs_all[self.xp.arange(batch_size), e2]
             loss = self.binary_cross_entropy(probs, Y)
@@ -135,7 +135,7 @@ class BaseModel(object):
             batch_size, = e1.shape
             probs_all = self.forward(e1, rel, None)
             evaluator = Evaluator()
-            evaluator.process_batch(probs_all, e2, flt)
+            evaluator.process_batch(self.xp, probs_all, e2, flt)
             metrics = evaluator.results()
             probs = probs_all[self.xp.arange(batch_size), e2]
             loss = self.binary_cross_entropy(probs, Y)
@@ -563,7 +563,7 @@ def main():
         for batch in val_iter:
             e1, rel, e2, _, flt = convert(batch, args.gpu)
             probs = model.forward(e1, rel, None)
-            evaluator.process_batch(probs, e2, flt)
+            evaluator.process_batch(model.xp, probs, e2, flt)
         metrics = evaluator.results()
         print(metrics, file=sys.stderr)
 
