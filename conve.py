@@ -558,7 +558,7 @@ def main():
     log_interval = 100, 'iteration'
 
     @chainer.training.make_extension()
-    def translate(trainer):
+    def evaluate(trainer):
         evaluator = Evaluator()
         for batch in val_iter:
             e1, rel, e2, _, flt = convert(batch, args.gpu)
@@ -571,10 +571,7 @@ def main():
     trainer.extend(extensions.snapshot_object(
         model, 'model_iter_{.updater.iteration}'), trigger=val_interval)
     trainer.extend(extensions.LogReport(trigger=log_interval))
-    trainer.extend(extensions.PrintReport(['epoch', 'main/loss',
-        'validation/main/loss', 'validation/main/mrr', 'validation/main/mrr(flt)',
-        'validation/main/hits1(flt)', 'validation/main/hits3(flt)',
-        'validation/main/hits10(flt)']), trigger=log_interval)
+    trainer.extend(extensions.PrintReport(['epoch', 'main/loss']), trigger=log_interval)
     trainer.extend(extensions.ProgressBar())
     trainer.run()
 
