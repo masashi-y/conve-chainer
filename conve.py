@@ -409,8 +409,7 @@ class FastEvalTripletDataset(chainer.dataset.DatasetMixin):
 
         if self.expand_graph:
             graph0 = defaultdict(list)
-            # trans = [self.relations[s] for s in ["hypernyms", "hyponyms"]]
-            trans = [self.relations[s] for s in ["_hypernym", "_instance_hypernym"]]
+            trans = [self.relations[s] for s in ["hypernyms", "hyponyms"]]
             for id_e1, id_rel in tqdm(self.graph, desc="extending graph"):
                 if id_rel not in trans:
                     graph0[id_e1, id_rel] = self.graph[id_e1, id_rel]
@@ -535,16 +534,30 @@ def main():
     train_iter = chainer.iterators.SerialIterator(train, args.batchsize)
     val_iter = chainer.iterators.SerialIterator(val, args.batchsize, repeat=False)
 
+    @chainer.training.make_extension()
+    def evaluate(trainer):
+        probs = []
+        e2s = []
+        flts = []
+        for batch in val_iter:
+            e1, rel, e2, _, flt = convert(batch, args.gpu)
+            with chainer.no_backprop_mode(), chainer.using_config('train', False):
+                prob = model.forward(e1, rel, None)
+            probs.append(prob)
+            e2s.append(e2)
+            flts.append(flt)
+        metrics = model.evaluate(F.concat(probs, axis=0),
+                F.concat(e2s, axis=0), F.concat(flts, axis=0))
+        print(metrics, file=sys.stderr)
+
     updater = training.StandardUpdater(
         train_iter, optimizer, converter=convert, device=args.gpu)
-
     trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=args.out)
 
     val_interval = args.val_iter, 'iteration'
     log_interval = 100, 'iteration'
 
-    trainer.extend(extensions.Evaluator(val_iter, model,
-        converter=convert, device=args.gpu), trigger=val_interval)
+    trainer.extend(evaluate, trigger=val_interval)
     trainer.extend(extensions.snapshot_object(
         model, 'model_iter_{.updater.iteration}'), trigger=val_interval)
     trainer.extend(extensions.LogReport(trigger=log_interval))
