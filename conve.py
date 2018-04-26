@@ -20,6 +20,34 @@ from chainer.training import extensions
 logger = logging.getLogger()
 logging.basicConfig(level=logging.INFO)
 
+IGNORE = -1
+UNK = "<unk>"
+
+
+def concat_arrays(arrays, length=None):
+    if length is None:
+        length = max(len(a) for a in arrays)
+    res = -np.ones((len(arrays), max_len), 'i')
+    for i, array in enumerate(arrays):
+        for j, v in enumerate(array):
+            res[i, j] = v
+    return res
+
+
+def load_pretrained_embeddings(filepath):
+    io = open(filepath)
+    dim = len(io.readline().split())
+    io.seek(0)
+    nvocab = sum(1 for line in io)
+    io.seek(0)
+    res = np.empty((nvocab, dim), dtype=np.float32)
+    for i, line in enumerate(io):
+        line = line.strip()
+        if len(line) == 0: continue
+        res[i] = line.split()
+    io.close()
+    return res
+
 class Evaluator(object):
     def __init__(self):
         self.total = 0
@@ -83,30 +111,23 @@ class BaseModel(object):
         loss = - F.average(losses)
         return loss
 
-    def __call__(self, e1, rel, e2, Y, flt):
-        if self.fast_eval:
-            return self.call_fast_evaluation(e1, rel, e2, Y, flt)
-        else:
-            return self.call_negative_sampling(e1, rel, e2, Y, flt)
+    def __call__(self, e1, char_e1, rel, e2, char_e2, Y, flt):
+        # if self.fast_eval:
+            # return self.call_fast_evaluation(e1, rel, e2, Y, flt)
+        # else:
+        return self.call_negative_sampling(
+                e1, char_e1, rel, e2, char_e1, Y, flt)
 
-    def call_negative_sampling(self, e1, rel, e2, Y, flt):
-        """
-        Input:
-            e1, rel, e2: ids for each entity and relation (shape : (batchsize,) )
-            Y: whether true (1) or negative (0) sample (shape : (batchsize,) )
-            flt: {0, 1} array used for filter evaluation (shape : (batch_size, num_entities) )
-        Output:
-            loss ( float )
-        """
+    def call_negative_sampling(self, e1, char_e1, rel, e2, char_e2, Y, flt):
         if chainer.config.train:
-            probs = self.forward(e1, rel, e2)
+            probs = self.forward(char_e1, rel, char_e2)
             loss = self.binary_cross_entropy(probs, Y)
             reporter.report({'loss': loss}, self)
             return loss
         else:
             assert flt is not None
             batch_size, = e1.shape
-            probs_all = self.forward(e1, rel, None)
+            probs_all = self.forward(char_e1, rel, char_e2)
             evaluator = Evaluator()
             evaluator.process_batch(self.xp, probs_all, e2, flt)
             metrics = evaluator.results()
@@ -115,196 +136,58 @@ class BaseModel(object):
             metrics['loss'] = loss
             reporter.report(metrics, self)
             return loss
-
-    def call_fast_evaluation(self, e1, rel, e2, Y, flt):
-        """
-        Input:
-            e1, rel, e2: ids for each entity and relation (shape : (batchsize,) )
-            Y: whether true (1) or negative (0) sample (shape : (batchsize,) )
-            flt: {0, 1} array used for filter evaluation (shape : (batch_size, num_entities) )
-        Output:
-            loss ( float )
-        """
-        if chainer.config.train:
-            probs = self.forward(e1, rel)
-            probs = probs.reshape((-1,))
-            loss = self.binary_cross_entropy(probs, Y)
-            reporter.report({'loss': loss}, self)
-            return loss
-        else:
-            assert flt is not None
-            batch_size, = e1.shape
-            probs_all = self.forward(e1, rel, None)
-            evaluator = Evaluator()
-            evaluator.process_batch(self.xp, probs_all, e2, flt)
-            metrics = evaluator.results()
-            probs = probs_all[self.xp.arange(batch_size), e2]
-            loss = self.binary_cross_entropy(probs, Y)
-            metrics['loss'] = loss
-            reporter.report(metrics, self)
-            return loss
-
-
-class DistMult(chainer.Chain, BaseModel):
-    """
-    DistMult
-    """
-    def __init__(self, num_entities, num_relations, fast_eval, embedding_dim=200):
-        super(DistMult, self).__init__()
-        self.fast_eval = fast_eval
-        self.num_entities = num_entities
-        self.num_relations = num_relations
-        self.embedding_dim = embedding_dim
-
-        with self.init_scope():
-            self.emb_e = L.EmbedID(
-                    num_entities, embedding_dim, initialW=I.GlorotNormal())
-            self.emb_rel = L.EmbedID(
-                    num_relations, embedding_dim, initialW=I.GlorotNormal())
-
-    def forward(self, e1, rel, e2=None):
-        """
-        Input:
-            e1, rel, e2: ids for each entity and relation (shape : (batchsize,) )
-        Output:
-            score (shape : (batchsize,) )
-        """
-        batch_size, = e1.shape
-        e1_embedded = self.emb_e(e1)
-        rel_embedded = self.emb_rel(rel)
-
-        e1_embedded = F.dropout(e1_embedded, 0.2)
-        rel_embedded = F.dropout(rel_embedded, 0.2)
-
-        if e2 is not None:
-            e2_embedded = self.emb_e(e2)
-            pred = e1_embedded * rel_embedded * e2_embedded
-            pred = F.sigmoid(F.sum(pred, 1))
-            return pred
-        else:
-            pred = F.matmul(e1_embedded * rel_embedded, self.emb_e.W, transb=True)
-            pred = F.sigmoid(pred)
-            return pred
 
 
 class ComplEx(chainer.Chain, BaseModel):
-    """
-    Complex Embeddings for Simple Link Prediction, Théo Trouillon et al., 2016
-    """
-    def __init__(self, num_entities, num_relations, fast_eval, embedding_dim=200):
+    def __init__(self, num_chars, num_entities, num_relations, char_dim, embedding_dim=200):
         super(ComplEx, self).__init__()
-        self.fast_eval = fast_eval
+        self.char_dim = char_dim
+        self.num_chars = num_chars
         self.num_entities = num_entities
         self.num_relations = num_relations
         self.embedding_dim = embedding_dim
 
         with self.init_scope():
-            self.emb_e_real = L.EmbedID(
-                    num_entities, embedding_dim, initialW=I.GlorotNormal())
-            self.emb_e_img = L.EmbedID(
-                    num_entities, embedding_dim, initialW=I.GlorotNormal())
+            self.emb_e = L.EmbedID(num_chars, char_dim,
+                    initialW=I.GlorotNormal(), ignore_label=IGNORE)
+            self.conv_char=L.Convolution2D(1, embedding_dim * 2, # for real & img
+                        (3, char_dim), stride=1, pad=(1, 0)),
             self.emb_rel_real = L.EmbedID(
                     num_relations, embedding_dim, initialW=I.GlorotNormal())
             self.emb_rel_img = L.EmbedID(
                     num_relations, embedding_dim, initialW=I.GlorotNormal())
 
-    def forward(self, e1, rel, e2=None):
-        """
-        Input:
-            e1, rel, e2: ids for each entity and relation (shape : (batchsize,) )
-        Output:
-            score (shape : (batchsize,) )
-        """
-        batch_size, = e1.shape
-        e1_embedded_real = self.emb_e_real(e1).reshape(batch_size, -1)
-        rel_embedded_real = self.emb_rel_real(rel).reshape(batch_size, -1)
-        e1_embedded_img = self.emb_e_img(e1).reshape(batch_size, -1)
-        rel_embedded_img = self.emb_rel_img(rel).reshape(batch_size, -1)
+    def forward(self, char_e1, rel, char_e2):
+        batch_e1, seq_len = char_e1.shape
+        batch_e2, _ = char_e2.shape
+        batchsize = batch_e1 + batch_e2
+        e1_real, e1_img, e2_real, e2_img = F.split_axis(F.reshape(
+            F.max_pooling_2d( # (batchsize, embedding_dim * 4, 1, 1)
+            self.conv_char( # (batchsize, embedding_dim * 4, seqlen, 1)
+                F.expand_dim(
+                self.emb_char( # (batchsize, seq_len, char_dim)
+                    F.concat([char_e1, char_e2], axis=0)), 1)),
+                (seq_len, 1)),
+            (batchsize, self.embedding_dim)),
+            [batch_e1, batch_e1*2, batch_e1*2+batch_e2)
 
-        e1_embedded_real = F.dropout(e1_embedded_real, 0.2)
-        rel_embedded_real = F.dropout(rel_embedded_real, 0.2)
-        e1_embedded_img = F.dropout(e1_embedded_img, 0.2)
-        rel_embedded_img = F.dropout(rel_embedded_img, 0.2)
+        rel_real = self.emb_rel_real(rel)
+        rel_img = self.emb_rel_img(rel)
 
-        if e2 is not None:
-            e2_embedded_real = self.emb_e_real(e2)
-            e2_embedded_img = self.emb_e_img(e2)
-            realrealreal = e1_embedded_real * rel_embedded_real * e2_embedded_real
-            realimgimg = e1_embedded_real * rel_embedded_img * e2_embedded_img
-            imgrealimg = e1_embedded_img * rel_embedded_real * e2_embedded_img
-            imgimgreal = e1_embedded_img * rel_embedded_img * e2_embedded_real
-            pred = realrealreal + realimgimg + imgrealimg - imgimgreal
-            pred = F.sigmoid(F.sum(pred, 1))
-            return pred
-        else:
-            realrealreal = F.matmul(e1_embedded_real * rel_embedded_real, self.emb_e_real.W, transb=True)
-            realimgimg = F.matmul(e1_embedded_real * rel_embedded_img, self.emb_e_img.W, transb=True)
-            imgrealimg = F.matmul(e1_embedded_img * rel_embedded_real, self.emb_e_img.W, transb=True)
-            imgimgreal = F.matmul(e1_embedded_img * rel_embedded_img, self.emb_e_real.W, transb=True)
-            pred = realrealreal + realimgimg + imgrealimg - imgimgreal
-            pred = F.sigmoid(pred)
-            return pred
+        e1_real = F.dropout(e1_real, 0.2)
+        e1_img = F.dropout(e1_img, 0.2)
+        e2_real = F.dropout(e2_real, 0.2)
+        e2_img = F.dropout(e2_img, 0.2)
+        rel_real = F.dropout(rel_real, 0.2)
+        rel_img = F.dropout(rel_img, 0.2)
 
-
-class ConvE(chainer.Chain, BaseModel):
-    """
-    Convolutional 2D Knowledge Graph Embeddings, Tim Dettmers et al., 2017
-    """
-    def __init__(self, num_entities, num_relations, fast_eval):
-        super(ConvE, self).__init__()
-        self.fast_eval = fast_eval
-        self.num_entities = num_entities
-        self.num_relations = num_relations
-        self.embedding_dim = 200
-
-        with self.init_scope():
-            self.emb_e = L.EmbedID(
-                    num_entities, self.embedding_dim, initialW=I.GlorotNormal())
-            self.emb_rel = L.EmbedID(
-                    num_relations, self.embedding_dim, initialW=I.GlorotNormal())
-            self.conv1 = L.Convolution2D(1, 32, 3, stride=1, pad=0)
-            self.bias = L.EmbedID(num_entities, 1)
-            self.fc = L.Linear(10368, self.embedding_dim)
-            self.bn0 = L.BatchNormalization(1)
-            self.bn1 = L.BatchNormalization(32)
-            self.bn2 = L.BatchNormalization(self.embedding_dim)
-
-    def forward(self, e1, rel, e2=None):
-        """
-        Input:
-            e1, rel, e2: ids for each entity and relation (shape : (batchsize,) )
-        Output:
-            score (shape : (batchsize,) )
-        """
-        batch_size, = e1.shape
-        e1_embedded = self.emb_e(e1).reshape(batch_size, 1, 10, 20)
-        rel_embedded = self.emb_rel(rel).reshape(batch_size, 1, 10, 20)
-
-        stacked_inputs = F.concat([e1_embedded, rel_embedded], axis=2)
-        stacked_inputs = self.bn0(stacked_inputs)
-        x = F.dropout(stacked_inputs, 0.2)
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = F.relu(x)
-        x = F.dropout(x, 0.2)
-        x = x.reshape(batch_size, -1)
-        x = self.fc(x)
-        x = F.dropout(x, 0.3)
-        x = self.bn2(x)
-        x = F.relu(x)
-        if e2 is not None:
-            e2_embedded = self.emb_e(e2)
-            bias = self.bias(e2).reshape((-1,))
-            x *= e2_embedded
-            x = F.sum(x, axis=1) + bias
-            pred = F.sigmoid(x)
-            return pred
-        else:
-            x = F.matmul(x, self.emb_e.W, transb=True)
-            x, bias = F.broadcast(x, self.bias.W.T)
-            x += bias
-            pred = F.sigmoid(x)
-            return pred
+        realrealreal = e1_real * rel_real * e2_real
+        realimgimg = e1_real * rel_img * e2_img
+        imgrealimg = e1_img * rel_real * e2_img
+        imgimgreal = e1_img * rel_img * e2_real
+        pred = realrealreal + realimgimg + imgrealimg - imgimgreal
+        pred = F.sigmoid(F.sum(pred, 1))
+        return pred
 
 
 class Vocab(object):
@@ -334,160 +217,106 @@ class Vocab(object):
 
 
 class TripletDataset(chainer.dataset.DatasetMixin):
-    def __init__(self, ent_vocab, rel_vocab, path, negative, flt_graph=None):
+    def __init__(self, char_vocab, ent_vocab, rel_vocab, path, negative, validation=False):
         self.path = path
-        logger.info("creating TripletDataset for: {}".format(self.path))
-        self.negative = negative
+        logger.info("creating CharacterTripletDataset for: {}".format(self.path))
+        self.chars = char_vocab
+        assert UNK in self.chars
+        self.unk = self.chars[UNK]
         self.entities = ent_vocab
         self.relations = rel_vocab
         self.data = []
-        if flt_graph is not None:
-            logger.info("filtered on")
-            self.filtered = True
-            self.graph = flt_graph
-        else:
-            logger.info("filtered off")
-            self.filtered = False
-            self.graph = defaultdict(list)
+        self.graph = defaultdict(list)
+        self.negative = negative
+        self.validation = validation
         self.load_from_path()
 
     def __len__(self):
         return len(self.data)
 
+    def embed(self, entity):
+        return [self.chars.get(c, self.unk) for c in entity]
+
     def load_from_path(self):
         logger.info("start loading dataset")
         for line in open(self.path):
             e1, rel, e2 = line.strip().split("\t")
-            id_e1 = self.entities[e1]
-            id_e2 = self.entities[e2]
-            id_rel = self.relations[rel]
-            self.data.append((id_e1, id_rel, id_e2))
-            self.graph[id_e1, id_rel].append(id_e2)
+            e1 = self.entities[e1]
+            e2 = self.entities[e2]
+            rel = self.relations[rel]
+            self.data.append((e1, rel, e2))
+            self.graph[e1, rel].append(e2)
         logger.info("done")
         self.num_entities = len(self.entities)
         self.num_relations = len(self.relations)
+        self.num_chars = len(self.chars)
+        self.e2s = [self.embed(e) for e in self.entities.id2word]
         logger.info("num samples: {}".format(len(self)))
         logger.info("num entities: {}".format(self.num_entities))
         logger.info("num relations: {}".format(self.num_relations))
 
     def get_example(self, i):
-        triplet = self.data[i]
-        triplets = np.asarray(triplet * (1 + self.negative), 'i').reshape((-1, 3))
+        e1_id, rel, e2_id = self.data[i]
+        triplets = np.asarray((e1_id, rel, e2_id) * (1 + self.negative), 'i').reshape((-1, 3))
         neg_ents = np.random.randint(0, self.num_entities, size=self.negative)
         head_or_tail = 2 * np.random.randint(0, 2, size=self.negative)
         triplets[np.arange(1, self.negative+1), head_or_tail] = neg_ents
         e1, rel, e2 = zip(*triplets)
         Y = np.zeros(1 + self.negative, 'i')
+        char_e1 = [self.e2s[e] for e in e1]
+        char_e2 = [self.e2s[e] for e in e2]
         Y[0] = 1
         if self.filtered:
-            e1_id, rel_id, e2_id = triplet
             flt = np.ones(self.num_entities, 'f')
             flt[self.graph[e1_id, rel_id]] = 0.
             flt[e2_id] = 1.
         else:
             flt = None
-        return e1, rel, e2, Y, flt
 
-
-class FastEvalTripletDataset(chainer.dataset.DatasetMixin):
-    """
-    Dataset to perform the technique in:
-      4.1 Fast Evaluation for Link Prediction Tasks
-      (Convolutional 2D Knowledge Graph Embeddings, Tim Dettmers et al.)
-    """
-    def __init__(self, ent_vocab, rel_vocab, path, expand_graph=True):
-        self.path = path
-        logger.info("creating FastEvalTripletDataset for: {}".format(self.path))
-        self.entities = ent_vocab
-        self.relations = rel_vocab
-        self.data = []
-        self.graph = defaultdict(list)
-        self.expand_graph = expand_graph
-        self.load_from_path()
-
-    def __len__(self):
-        return len(self.data)
-
-    def load_from_path(self):
-        logger.info("start loading dataset")
-        for line in open(self.path):
-            e1, rel, e2 = line.strip().split("\t")
-            id_e1 = self.entities[e1]
-            id_e2 = self.entities[e2]
-            id_rel = self.relations[rel]
-            self.graph[id_e1, id_rel].append(id_e2)
-        self.data.extend(list(self.graph.items()))
-        logger.info("done")
-        self.num_entities = len(self.entities)
-        self.num_relations = len(self.relations)
-        logger.info("num samples: {}".format(len(self)))
-        logger.info("num entities: {}".format(self.num_entities))
-        logger.info("num relations: {}".format(self.num_relations))
-
-        if self.expand_graph:
-            graph0 = defaultdict(list)
-            trans = [self.relations[s] for s in ["hypernyms", "hyponyms"]]
-            for id_e1, id_rel in tqdm(self.graph, desc="extending graph"):
-                if id_rel not in trans:
-                    graph0[id_e1, id_rel] = self.graph[id_e1, id_rel]
-                    continue
-
-                res = []
-                def traverse(e1, rel, depth):
-                    res.append(e1)
-                    if depth <= 0: return
-                    if (e1, rel) in self.graph:
-                        for e2 in self.graph[e1, rel]:
-                            traverse(e2, rel, depth - 1)
-
-                for e2 in self.graph[id_e1, id_rel]:
-                    traverse(e2, id_rel, 50)
-                graph0[id_e1, id_rel] = list(set(res))
-            self.graph = graph0
-            self.data = list(graph0.items())
-
-    def get_example(self, i):
-        (e1, rel), e2 = self.data[i]
-        e1 = np.array([e1], 'i')
-        rel = np.array([rel], 'i')
-        e2 = np.array(e2, 'i')
-        Y = np.zeros(self.num_entities, 'i')
-        Y[e2] = 1
-        flt = None
-        return e1, rel, e2, Y, flt
+        if self.validation:
+            e2 = self.entities.id2word
+            char_e2 = self.e2s
+        return e1, char_e1, rel, e2, char_e2, Y, flt
 
 
 def convert(batch, device):
-    e1, rel, e2, Y, flt = zip(*batch)
+    e1, char_e1, rel, e2, char_e2, Y, flt = zip(*batch)
     e1  = np.concatenate(e1)
     rel = np.concatenate(rel)
     e2  = np.concatenate(e2)
+    length = max(max(e for ce in char_e1 for e in ce),
+            max(e for ce in char_e2 for e in ce))
+    char_e1 = concat_arrays([e for ce in char_e1 for e in ce], length=length)
+    char_e2 = concat_arrays([e for ce in char_e2 for e in ce], length=length)
     Y   = np.concatenate(Y)
     flt = np.vstack(flt) if flt[0] is not None else None
     if device >= 0:
         e1  = cuda.to_gpu(e1)
         rel = cuda.to_gpu(rel)
         e2  = cuda.to_gpu(e2)
+        char_e1  = cuda.to_gpu(char_e1)
+        char_e2  = cuda.to_gpu(char_e2)
         Y   = cuda.to_gpu(Y)
         if flt is not None:
             flt = cuda.to_gpu(flt)
-    return e1, rel, e2, Y, flt
+    return e1, char_e1, rel, e2, char_e1, Y, flt
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('train', help='Path to training triplet list file')
     parser.add_argument('val', help='Path to validation triplet list file')
+    parser.add_argument('char_vocab', help='Path to character vocab')
     parser.add_argument('ent_vocab', help='Path to entity vocab')
     parser.add_argument('rel_vocab', help='Path to relation vocab')
-    parser.add_argument('--model', default='conve',
-                    choices=['complex', 'conve', 'distmult'])
     parser.add_argument('--gpu', '-g', default=-1, type=int,
                         help='GPU ID (negative value indicates CPU)')
     parser.add_argument('--batchsize', '-b', type=int, default=1000,
                         help='learning minibatch size')
     parser.add_argument('--epoch', '-e', default=20, type=int,
                         help='number of epochs to learn')
+    parser.add_argument('--char-dim', '-c', default=30, type=int,
+                        help='the dimension of character embedding')
     parser.add_argument('--negative-size', default=10, type=int,
                         help='number of negative samples')
     parser.add_argument('--out', default='result',
@@ -511,7 +340,6 @@ def main():
     logger.info('train: {}'.format(args.train))
     logger.info('val: {}'.format(args.val))
     logger.info('gpu: {}'.format(args.gpu))
-    logger.info('model: {}'.format(args.model))
     logger.info('batchsize: {}'.format(args.batchsize))
     logger.info('epoch: {}'.format(args.epoch))
     logger.info('negative-size: {}'.format(args.negative_size))
@@ -521,23 +349,14 @@ def main():
         chainer.cuda.get_device_from_id(args.gpu).use()
         cuda.check_cuda_available()
 
+    char_vocab = Vocab.load(args.char_vocab)
     ent_vocab = Vocab.load(args.ent_vocab)
     rel_vocab = Vocab.load(args.rel_vocab)
 
-    if args.fast_eval:
-        train = FastEvalTripletDataset(ent_vocab, rel_vocab, args.train, args.expand_graph)
-    else:
-        train = TripletDataset(ent_vocab, rel_vocab, args.train, args.negative_size)
-    val = TripletDataset(ent_vocab, rel_vocab, args.val, 0, train.graph)
+    train = TripletDataset(char_vocab, ent_vocab, rel_vocab, args.train, args.negative_size)
+    val = TripletDataset(char_vocab, ent_vocab, rel_vocab, args.val, 0)
 
-    if args.model == 'conve':
-        model = ConvE(train.num_entities, train.num_relations, args.fast_eval)
-    elif args.model == 'complex':
-        model = ComplEx(train.num_entities, train.num_relations, args.fast_eval)
-    elif args.model == 'distmult':
-        model = DistMult(train.num_entities, train.num_relations, args.fast_eval)
-    else:
-        raise "no such model available: {}".format(args.model)
+    model = ComplEx(train.num_chars, train.num_entities, train.num_relations, args.char_dim, 200)
 
     if args.init_model:
         logger.info("initialize model with: {}".format(args.init_model))
@@ -564,8 +383,8 @@ def main():
         if hasattr(val_iter, 'reset'):
             val_iter.reset()
         for batch in val_iter:
-            e1, rel, e2, _, flt = convert(batch, args.gpu)
-            probs = model.forward(e1, rel, None)
+            e1, char_e1, rel, e2, char_e2, _, flt = convert(batch, args.gpu)
+            probs = model.forward(char_e1, rel, char_e2)
             evaluator.process_batch(model.xp, probs, e2, flt)
         metrics = evaluator.results()
         print(metrics, file=sys.stderr)
