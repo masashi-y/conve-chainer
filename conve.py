@@ -27,7 +27,7 @@ UNK = "<unk>"
 def concat_arrays(arrays, length=None):
     if length is None:
         length = max(len(a) for a in arrays)
-    res = -np.ones((len(arrays), max_len), 'i')
+    res = -np.ones((len(arrays), length), 'i')
     for i, array in enumerate(arrays):
         for j, v in enumerate(array):
             res[i, j] = v
@@ -148,10 +148,10 @@ class ComplEx(chainer.Chain, BaseModel):
         self.embedding_dim = embedding_dim
 
         with self.init_scope():
-            self.emb_e = L.EmbedID(num_chars, char_dim,
+            self.emb_char = L.EmbedID(num_chars, char_dim,
                     initialW=I.GlorotNormal(), ignore_label=IGNORE)
             self.conv_char=L.Convolution2D(1, embedding_dim * 2, # for real & img
-                        (3, char_dim), stride=1, pad=(1, 0)),
+                        (3, char_dim), stride=1, pad=(1, 0))
             self.emb_rel_real = L.EmbedID(
                     num_relations, embedding_dim, initialW=I.GlorotNormal())
             self.emb_rel_img = L.EmbedID(
@@ -161,16 +161,18 @@ class ComplEx(chainer.Chain, BaseModel):
         batch_e1, seq_len = char_e1.shape
         batch_e2, _ = char_e2.shape
         batchsize = batch_e1 + batch_e2
-        e1_real, e1_img, e2_real, e2_img = F.split_axis(F.reshape(
+        e1, e2 = F.split_axis(F.reshape(
             F.max_pooling_2d( # (batchsize, embedding_dim * 4, 1, 1)
             self.conv_char( # (batchsize, embedding_dim * 4, seqlen, 1)
-                F.expand_dim(
+                F.expand_dims(
                 self.emb_char( # (batchsize, seq_len, char_dim)
                     F.concat([char_e1, char_e2], axis=0)), 1)),
-                (seq_len, 1)),
-            (batchsize, self.embedding_dim)),
-            [batch_e1, batch_e1*2, batch_e1*2+batch_e2)
+                ksize=(seq_len, 1)),
+            (batchsize, self.embedding_dim*2)),
+            [batch_e1], 0)
 
+        e1_real, e1_img = F.split_axis(e1, 2, 1)
+        e2_real, e2_img = F.split_axis(e2, 2, 1)
         rel_real = self.emb_rel_real(rel)
         rel_img = self.emb_rel_img(rel)
 
@@ -187,6 +189,7 @@ class ComplEx(chainer.Chain, BaseModel):
         imgimgreal = e1_img * rel_img * e2_real
         pred = realrealreal + realimgimg + imgrealimg - imgimgreal
         pred = F.sigmoid(F.sum(pred, 1))
+        print(pred.shape)
         return pred
 
 
@@ -221,7 +224,7 @@ class TripletDataset(chainer.dataset.DatasetMixin):
         self.path = path
         logger.info("creating CharacterTripletDataset for: {}".format(self.path))
         self.chars = char_vocab
-        assert UNK in self.chars
+        assert UNK in self.chars.word2id
         self.unk = self.chars[UNK]
         self.entities = ent_vocab
         self.relations = rel_vocab
@@ -235,7 +238,7 @@ class TripletDataset(chainer.dataset.DatasetMixin):
         return len(self.data)
 
     def embed(self, entity):
-        return [self.chars.get(c, self.unk) for c in entity]
+        return [self.chars[c] for c in entity]
 
     def load_from_path(self):
         logger.info("start loading dataset")
@@ -256,8 +259,8 @@ class TripletDataset(chainer.dataset.DatasetMixin):
         logger.info("num relations: {}".format(self.num_relations))
 
     def get_example(self, i):
-        e1_id, rel, e2_id = self.data[i]
-        triplets = np.asarray((e1_id, rel, e2_id) * (1 + self.negative), 'i').reshape((-1, 3))
+        e1_id, rel_id, e2_id = self.data[i]
+        triplets = np.asarray((e1_id, rel_id, e2_id) * (1 + self.negative), 'i').reshape((-1, 3))
         neg_ents = np.random.randint(0, self.num_entities, size=self.negative)
         head_or_tail = 2 * np.random.randint(0, 2, size=self.negative)
         triplets[np.arange(1, self.negative+1), head_or_tail] = neg_ents
@@ -266,16 +269,15 @@ class TripletDataset(chainer.dataset.DatasetMixin):
         char_e1 = [self.e2s[e] for e in e1]
         char_e2 = [self.e2s[e] for e in e2]
         Y[0] = 1
-        if self.filtered:
+
+        if self.validation:
+            e2 = np.arange(self.num_entities)
+            char_e2 = self.e2s
             flt = np.ones(self.num_entities, 'f')
             flt[self.graph[e1_id, rel_id]] = 0.
             flt[e2_id] = 1.
         else:
             flt = None
-
-        if self.validation:
-            e2 = self.entities.id2word
-            char_e2 = self.e2s
         return e1, char_e1, rel, e2, char_e2, Y, flt
 
 
@@ -284,8 +286,8 @@ def convert(batch, device):
     e1  = np.concatenate(e1)
     rel = np.concatenate(rel)
     e2  = np.concatenate(e2)
-    length = max(max(e for ce in char_e1 for e in ce),
-            max(e for ce in char_e2 for e in ce))
+    length = max(max(len(e) for ce in char_e1 for e in ce),
+            max(len(e) for ce in char_e2 for e in ce))
     char_e1 = concat_arrays([e for ce in char_e1 for e in ce], length=length)
     char_e2 = concat_arrays([e for ce in char_e2 for e in ce], length=length)
     Y   = np.concatenate(Y)
@@ -354,7 +356,7 @@ def main():
     rel_vocab = Vocab.load(args.rel_vocab)
 
     train = TripletDataset(char_vocab, ent_vocab, rel_vocab, args.train, args.negative_size)
-    val = TripletDataset(char_vocab, ent_vocab, rel_vocab, args.val, 0)
+    val = TripletDataset(char_vocab, ent_vocab, rel_vocab, args.val, 0, validation=True)
 
     model = ComplEx(train.num_chars, train.num_entities, train.num_relations, args.char_dim, 200)
 
