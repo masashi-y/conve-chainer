@@ -406,7 +406,8 @@ def main():
             val_iter.reset()
         for batch in val_iter:
             _, char_e1, rel, e2, _, _, flt = convert(batch, args.gpu)
-            probs = model.forward(char_e1, rel, None, validation=True)
+            with chainer.no_backprop_mode(), chainer.using_config('train', False):
+                probs = model.forward(char_e1, rel, None, validation=True)
             evaluator.process_batch(model.xp, probs, e2, flt)
         metrics = evaluator.results()
         print(metrics, file=sys.stderr)
