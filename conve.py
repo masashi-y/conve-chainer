@@ -299,8 +299,12 @@ def convert(batch, device):
     e1  = np.concatenate(e1)
     rel = np.concatenate(rel)
     e2  = np.concatenate(e2)
-    length = max(max(len(e) for ce in char_e1 for e in ce),
-            max(len(e) for ce in char_e2 for e in ce))
+    if char_e2[0] is not None:
+        length = max(max(len(e) for ce in char_e1 for e in ce),
+                max(len(e) for ce in char_e2 for e in ce))
+    else:
+        char_e2 = None
+        length = max(len(e) for ce in char_e1 for e in ce)
     char_e1 = concat_arrays([e for ce in char_e1 for e in ce], length=length)
     char_e2 = concat_arrays([e for ce in char_e2 for e in ce],
                 length=length) if char_e2 is not None else None
