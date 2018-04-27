@@ -112,40 +112,24 @@ class BaseModel(object):
         return loss
 
     def __call__(self, e1, char_e1, rel, e2, char_e2, Y, flt):
-        # if self.fast_eval:
-            # return self.call_fast_evaluation(e1, rel, e2, Y, flt)
-        # else:
-        return self.call_negative_sampling(
-                e1, char_e1, rel, e2, char_e1, Y, flt)
-
-    def call_negative_sampling(self, e1, char_e1, rel, e2, char_e2, Y, flt):
-        if chainer.config.train:
-            probs = self.forward(char_e1, rel, char_e2)
-            loss = self.binary_cross_entropy(probs, Y)
-            reporter.report({'loss': loss}, self)
-            return loss
-        else:
-            assert flt is not None
-            batch_size, = e1.shape
-            probs_all = self.forward(char_e1, rel, char_e2)
-            evaluator = Evaluator()
-            evaluator.process_batch(self.xp, probs_all, e2, flt)
-            metrics = evaluator.results()
-            probs = probs_all[self.xp.arange(batch_size), e2]
-            loss = self.binary_cross_entropy(probs, Y)
-            metrics['loss'] = loss
-            reporter.report(metrics, self)
-            return loss
+        probs = self.forward(char_e1, rel, char_e2)
+        loss = self.binary_cross_entropy(probs, Y)
+        reporter.report({'loss': loss}, self)
+        return loss
 
 
 class ComplEx(chainer.Chain, BaseModel):
-    def __init__(self, num_chars, num_entities, num_relations, char_dim, embedding_dim=200):
+    def __init__(self, num_chars, num_entities, num_relations,
+                char_dim, embedding_dim=200, validation=None):
         super(ComplEx, self).__init__()
         self.char_dim = char_dim
         self.num_chars = num_chars
         self.num_entities = num_entities
         self.num_relations = num_relations
         self.embedding_dim = embedding_dim
+        self.validation = concat_arrays(validation)
+        if self.validation is not None:
+            self.validation = cuda.to_gpu(self.validation)
 
         with self.init_scope():
             self.emb_char = L.EmbedID(num_chars, char_dim,
@@ -157,10 +141,10 @@ class ComplEx(chainer.Chain, BaseModel):
             self.emb_rel_img = L.EmbedID(
                     num_relations, embedding_dim, initialW=I.GlorotNormal())
 
-    def forward(self, char_e1, rel, char_e2, validation=False):
+    def embed_fast(self, char_e1, char_e2):
         batch_e1, seq_len = char_e1.shape
         batch_e2, _ = char_e2.shape
-        assert not validation or batch_e2 == self.num_entities
+        assert char_e1.shape == char_e2.shape
         batchsize = batch_e1 + batch_e2
         e1, e2 = F.split_axis(F.reshape(
             F.max_pooling_2d( # (batchsize, embedding_dim * 4, 1, 1)
@@ -171,10 +155,30 @@ class ComplEx(chainer.Chain, BaseModel):
                 ksize=(seq_len, 1)),
             (batchsize, self.embedding_dim*2)),
             [batch_e1], 0)
+        return e1, e2
+
+    def embed_separate(self, e):
+        batchsize, seq_len = e.shape
+        return F.reshape(
+                F.max_pooling_2d( # (batchsize, embedding_dim * 4, 1, 1)
+            self.conv_char( # (batchsize, embedding_dim * 4, seqlen, 1)
+                F.expand_dims(
+                self.emb_char( # (batchsize, seq_len, char_dim)
+                    e), 1)),
+                ksize=(seq_len, 1)),
+            (batchsize, self.embedding_dim*2))
+
+    def forward(self, char_e1, rel, char_e2, validation=False):
+        """ train """
+        if validation:
+            e1 = self.embed_separate(char_e1)
+            e2 = self.embed_separate(self.validation)
+            assert e2.shape[0] == self.num_entities
+        else:
+            e1, e2 = self.embed_fast(char_e1, char_e2)
 
         e1_real, e1_img = F.split_axis(e1, 2, 1)
         e2_real, e2_img = F.split_axis(e2, 2, 1)
-        assert not validation or e2_real.shape[0] == self.num_entities
         rel_real = self.emb_rel_real(rel)
         rel_img = self.emb_rel_img(rel)
 
@@ -281,8 +285,7 @@ class TripletDataset(chainer.dataset.DatasetMixin):
         Y[0] = 1
 
         if self.validation:
-            # e2 = np.arange(self.num_entities)
-            char_e2 = self.e2s
+            char_e2 = None
             flt = np.ones(self.num_entities, 'f')
             flt[self.graph[e1_id, rel_id]] = 0.
             flt[e2_id] = 1.
@@ -299,7 +302,8 @@ def convert(batch, device):
     length = max(max(len(e) for ce in char_e1 for e in ce),
             max(len(e) for ce in char_e2 for e in ce))
     char_e1 = concat_arrays([e for ce in char_e1 for e in ce], length=length)
-    char_e2 = concat_arrays([e for ce in char_e2 for e in ce], length=length)
+    char_e2 = concat_arrays([e for ce in char_e2 for e in ce],
+                length=length) if char_e2 is not None else None
     Y   = np.concatenate(Y)
     flt = np.vstack(flt) if flt[0] is not None else None
     if device >= 0:
@@ -307,7 +311,8 @@ def convert(batch, device):
         rel = cuda.to_gpu(rel)
         e2  = cuda.to_gpu(e2)
         char_e1  = cuda.to_gpu(char_e1)
-        char_e2  = cuda.to_gpu(char_e2)
+        char_e2  = cuda.to_gpu(char_e2) \
+                if char_e2 is not None else None
         Y   = cuda.to_gpu(Y)
         if flt is not None:
             flt = cuda.to_gpu(flt)
@@ -368,7 +373,8 @@ def main():
     train = TripletDataset(char_vocab, ent_vocab, rel_vocab, args.train, args.negative_size)
     val = TripletDataset(char_vocab, ent_vocab, rel_vocab, args.val, 0, validation=True)
 
-    model = ComplEx(train.num_chars, train.num_entities, train.num_relations, args.char_dim, 200)
+    model = ComplEx(train.num_chars, train.num_entities,
+            train.num_relations, args.char_dim, 200, validation=train.e2s)
 
     if args.init_model:
         logger.info("initialize model with: {}".format(args.init_model))
@@ -395,8 +401,8 @@ def main():
         if hasattr(val_iter, 'reset'):
             val_iter.reset()
         for batch in val_iter:
-            e1, char_e1, rel, e2, char_e2, _, flt = convert(batch, args.gpu)
-            probs = model.forward(char_e1, rel, char_e2)
+            _, char_e1, rel, e2, _, _, flt = convert(batch, args.gpu)
+            probs = model.forward(char_e1, rel, None, validation=True)
             evaluator.process_batch(model.xp, probs, e2, flt)
         metrics = evaluator.results()
         print(metrics, file=sys.stderr)
