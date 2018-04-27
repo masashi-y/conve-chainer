@@ -157,9 +157,10 @@ class ComplEx(chainer.Chain, BaseModel):
             self.emb_rel_img = L.EmbedID(
                     num_relations, embedding_dim, initialW=I.GlorotNormal())
 
-    def forward(self, char_e1, rel, char_e2):
+    def forward(self, char_e1, rel, char_e2, validation=False):
         batch_e1, seq_len = char_e1.shape
         batch_e2, _ = char_e2.shape
+        assert not validation or batch_e2 == self.num_entities
         batchsize = batch_e1 + batch_e2
         e1, e2 = F.split_axis(F.reshape(
             F.max_pooling_2d( # (batchsize, embedding_dim * 4, 1, 1)
@@ -173,6 +174,7 @@ class ComplEx(chainer.Chain, BaseModel):
 
         e1_real, e1_img = F.split_axis(e1, 2, 1)
         e2_real, e2_img = F.split_axis(e2, 2, 1)
+        assert not validation or e2_real.shape[0] == self.num_entities
         rel_real = self.emb_rel_real(rel)
         rel_img = self.emb_rel_img(rel)
 
@@ -183,14 +185,22 @@ class ComplEx(chainer.Chain, BaseModel):
         rel_real = F.dropout(rel_real, 0.2)
         rel_img = F.dropout(rel_img, 0.2)
 
-        realrealreal = e1_real * rel_real * e2_real
-        realimgimg = e1_real * rel_img * e2_img
-        imgrealimg = e1_img * rel_real * e2_img
-        imgimgreal = e1_img * rel_img * e2_real
-        pred = realrealreal + realimgimg + imgrealimg - imgimgreal
-        pred = F.sigmoid(F.sum(pred, 1))
-        print(pred.shape)
-        return pred
+        if not validation:
+            realrealreal = e1_real * rel_real * e2_real
+            realimgimg = e1_real * rel_img * e2_img
+            imgrealimg = e1_img * rel_real * e2_img
+            imgimgreal = e1_img * rel_img * e2_real
+            pred = realrealreal + realimgimg + imgrealimg - imgimgreal
+            pred = F.sigmoid(F.sum(pred, 1))
+            return pred
+        else:
+            realrealreal = F.matmul(e1_real * rel_real, e2_real, transb=True)
+            realimgimg = F.matmul(e1_real * rel_img, e2_img, transb=True)
+            imgrealimg = F.matmul(e1_img * rel_real, e2_img, transb=True)
+            imgimgreal = F.matmul(e1_img * rel_img, e2_real, transb=True)
+            pred = realrealreal + realimgimg + imgrealimg - imgimgreal
+            pred = F.sigmoid(pred)
+            return pred
 
 
 class Vocab(object):
@@ -271,7 +281,7 @@ class TripletDataset(chainer.dataset.DatasetMixin):
         Y[0] = 1
 
         if self.validation:
-            e2 = np.arange(self.num_entities)
+            # e2 = np.arange(self.num_entities)
             char_e2 = self.e2s
             flt = np.ones(self.num_entities, 'f')
             flt[self.graph[e1_id, rel_id]] = 0.
