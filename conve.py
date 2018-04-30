@@ -457,6 +457,29 @@ class FastEvalTripletDataset(chainer.dataset.DatasetMixin):
         return e1, rel, e2, Y, flt
 
 
+class CalculateMetrics(chainer.training.Extension):
+    trigger = 1, 'epoch'
+    priority = chainer.training.PRIORITY_WRITER
+
+    def __init__(self, model, test_data, key, device=-1):
+        self.model = model
+        self.test_data = test_data
+        self.key = key
+        self.device = device
+
+    def __call__(self, trainer):
+        evaluator = Evaluator()
+        if hasattr(self.test_data, 'reset'):
+            self.test_data.reset()
+        for batch in self.test_data:
+            _, char_e1, rel, e2, _, _, flt = convert(batch, self.device)
+            with chainer.no_backprop_mode(), chainer.using_config('train', False):
+                probs = self.model.forward(char_e1, rel, None, validation=True)
+            evaluator.process_batch(self.model.xp, probs, e2, flt)
+        metrics = evaluator.results()
+        print(self.key, metrics)
+
+
 def convert(batch, device):
     e1, rel, e2, Y, flt = zip(*batch)
     e1  = np.concatenate(e1)
@@ -558,19 +581,12 @@ def main():
     val_interval = args.val_iter, 'iteration'
     log_interval = 100, 'iteration'
 
-    @chainer.training.make_extension()
-    def evaluate(trainer):
-        evaluator = Evaluator()
-        if hasattr(val_iter, 'reset'):
-            val_iter.reset()
-        for batch in val_iter:
-            e1, rel, e2, _, flt = convert(batch, args.gpu)
-            probs = model.forward(e1, rel, None)
-            evaluator.process_batch(model.xp, probs, e2, flt)
-        metrics = evaluator.results()
-        print(metrics, file=sys.stderr)
-
-    trainer.extend(evaluate, trigger=val_interval)
+    trainer.extend(
+        CalculateMetrics(model, val_iter, 'validation metrics', device=args.gpu),
+        trigger=val_interval)
+    trainer.extend(
+        CalculateMetrics(model, train_iter, 'train metrics', device=args.gpu),
+        trigger=val_interval)
     trainer.extend(extensions.snapshot_object(
         model, 'model_iter_{.updater.iteration}'), trigger=val_interval)
     trainer.extend(extensions.LogReport(trigger=log_interval))
